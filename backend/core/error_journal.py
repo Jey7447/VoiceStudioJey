@@ -25,6 +25,7 @@ the 4-step mirror contract documented there.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -32,6 +33,8 @@ from collections import OrderedDict
 
 from core.config import DATA_DIR
 from core.scrub import scrub_text
+
+logger = logging.getLogger("omnivoice.error_journal")
 
 JOURNAL_PATH = os.path.join(DATA_DIR, "error_journal.jsonl")
 
@@ -76,6 +79,12 @@ _CLASS_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
         "connection refused",
         "connection reset",
         "connection aborted",
+        # transformers' download-failure wording ("We couldn't connect to
+        # '<endpoint>' to load the files") — the #874 mirror-down class was
+        # journaled as UNKNOWN without these.
+        "couldn't connect to",
+        "could not connect to",
+        "max retries exceeded",
         "timed out",
         "timeout",
         "name or service not known",
@@ -86,6 +95,22 @@ _CLASS_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 _AUTH_MARKERS = ("401", "403", "gated", "access", "token")
+
+
+def _coarse_stage(route: str) -> str:
+    """Reduce a route to its fixed HEAD segment ("/api/dub/start?x=1" → "dub").
+
+    This is what the opt-in analytics event carries as `stage`: route heads are
+    a closed set defined by the routers — path params (ids, filenames, names)
+    live in LATER segments and never ride along."""
+    try:
+        path = (route or "").split("?", 1)[0].strip("/")
+        parts = [p for p in path.split("/") if p]
+        if parts and parts[0] == "api":
+            parts = parts[1:]
+        return (parts[0] if parts else "")[:40]
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def classify_exception(exc: BaseException, trace: str = "") -> str:
@@ -115,17 +140,20 @@ def _fingerprint(error_class: str, exc: BaseException) -> str:
     return hashlib.sha1(raw.encode("utf-8", "replace"), usedforsecurity=False).hexdigest()[:16]
 
 
-def _persist_locked() -> None:
+def _persist_locked() -> bool:
     """Rewrite the JSONL mirror from the in-memory ring. Caller holds _lock.
-    Never raises — losing persistence must not break the exception handler."""
+    Never raises — losing persistence must not break the exception handler.
+    Returns whether the durable mirror was updated."""
     try:
         tmp = JOURNAL_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             for entry in _entries.values():
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         os.replace(tmp, JOURNAL_PATH)
+        return True
     except Exception:
-        pass
+        logger.warning("Error journal persistence failed; entries remain available in memory")
+        return False
 
 
 def _hydrate() -> None:
@@ -146,7 +174,7 @@ def _hydrate() -> None:
     except FileNotFoundError:
         pass
     except Exception:
-        pass
+        logger.warning("Error journal could not be loaded; starting with an empty in-memory journal")
 
 
 _hydrate()
@@ -186,6 +214,17 @@ def record(exc: BaseException, route: str = "", trace: str = "") -> dict:
                 while len(_entries) > _MAX_ENTRIES:
                     _entries.popitem(last=False)
             _persist_locked()
+        # Opt-in analytics (core/analytics.py): a no-op unless the user opted
+        # in AND the build ships a token. Carries the error CLASS and the
+        # coarse route head ONLY — never the message, trace, or any path —
+        # deduped by fingerprint and hard-capped per session there. Lazy
+        # import + never raises: telemetry must not shadow the real error.
+        try:
+            from core import analytics
+
+            analytics.record_error_event(error_class, fp, stage=_coarse_stage(route))
+        except Exception:
+            pass
         return entry
     except Exception:
         return {"error_class": "UNKNOWN", "type": type(exc).__name__, "count": 1}
@@ -198,10 +237,16 @@ def recent(limit: int = 20) -> list[dict]:
     return list(reversed(items))[: max(1, min(limit, _MAX_ENTRIES))]
 
 
-def clear() -> None:
+def clear() -> bool:
+    """Clear the journal, retaining memory state if durable deletion fails."""
     with _lock:
-        _entries.clear()
         try:
             os.remove(JOURNAL_PATH)
+        except FileNotFoundError:
+            # Idempotent clear: an already-absent durable mirror is success.
+            logger.debug("Error journal mirror already absent during clear")
         except OSError:
-            pass
+            logger.warning("Error journal could not be cleared; keeping entries available for retry")
+            return False
+        _entries.clear()
+        return True

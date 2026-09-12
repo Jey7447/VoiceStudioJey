@@ -22,9 +22,10 @@ import { useTranslation } from 'react-i18next';
 import { toast } from 'react-hot-toast';
 import { Check, ChevronRight } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { useModels, useInstallModel } from '../api/hooks';
+import { useEngines, useModels, useInstallModel, useSelectEngine } from '../api/hooks';
 import { setupDownloadStreamUrl } from '../api/setup';
-import { listEngines, selectEngine } from '../api/engines';
+import { notifyEngineSelected } from '../utils/engineSelectToast';
+import MirrorRescue from './MirrorRescue';
 import { Badge, Button } from '../ui';
 
 const fmtGB = (gb) => (gb == null ? '' : `${gb.toFixed(gb < 10 ? 1 : 0)} GB`);
@@ -60,6 +61,21 @@ export function isPlatformPick(model, platformTags) {
     Array.isArray(platformTags) &&
     model.platforms.some((p) => platformTags.includes(p))
   );
+}
+
+/**
+ * A model is "recommended" for this host when the backend marks it curated
+ * (`curated_on` in models.yaml — the same signal GET /setup/recommendations
+ * and the Settings model store use), so the wizard and the store can never
+ * disagree about what "recommended" means. Falls back to the platform-tag
+ * heuristic for older backends whose /models rows carry no `curated` flag.
+ * Required models are excluded — they already wear the stronger chip.
+ * Pure + exported for unit tests.
+ */
+export function isRecommendedPick(model, platformTags) {
+  if (!model || model.required) return false;
+  if (typeof model.curated === 'boolean') return model.curated;
+  return isPlatformPick(model, platformTags);
 }
 
 /** Overall progress from the backend's authoritative `aggregate` SSE event.
@@ -99,6 +115,88 @@ function formatEta(seconds) {
   return `${Math.round(seconds / 60)}m`;
 }
 
+/**
+ * Fold one download-stream SSE event into the wizard's per-repo progress map.
+ * Pure + exported for unit tests. Mirrors the Settings store's transitions, but
+ * with the wizard's leaner shape ({ phase, files, agg }).
+ *
+ * Key fix (P1-A): an `install_error` event is STORED with its `ev.error` text
+ * (the mirror-aware failure hint) and the row PERSISTS — previously the wizard
+ * deleted the row on error exactly like a success, so the user saw the download
+ * vanish with no reason. `install_done` still drops the row (it reverts to the
+ * authoritative `installed` flag); the caller does the list refetch.
+ */
+export function reduceWizardDownloadEvent(prev, ev) {
+  if (!ev || !ev.repo_id) return prev;
+  const key = `${ev.target || 'local'}\u0000${ev.repo_id}`;
+  const cur = prev[key] || { phase: 'active', files: {} };
+  // Lifecycle markers gate reset; a file-level 'done' must NOT clear the repo.
+  if (ev.phase === 'install_start') {
+    return { ...prev, [key]: { phase: 'active', files: {} } };
+  }
+  // Success terminal → drop the transient row.
+  if (ev.phase === 'install_done') {
+    const next = { ...prev };
+    delete next[key];
+    return next;
+  }
+  // Error terminal → KEEP the row + its message so it renders with a Retry.
+  // docs_topic carries the backend's failure class (core.failure.classify) so
+  // the wizard can react structurally — e.g. HF_MIRROR_UNREACHABLE raises the
+  // inline mirror picker — instead of string-matching the error text.
+  if (ev.phase === 'install_error') {
+    return {
+      ...prev,
+      [key]: {
+        ...cur,
+        phase: 'install_error',
+        error: ev.error,
+        docsTopic: ev.docs_topic || '',
+      },
+    };
+  }
+  // Authoritative overall progress (download_aggregator).
+  if (ev.phase === 'aggregate') {
+    return {
+      ...prev,
+      [key]: {
+        ...cur,
+        agg: {
+          bytesDone: ev.bytes_done || 0,
+          totalBytes: ev.total_bytes || 0,
+          rate: ev.rate || 0,
+          etaSeconds: ev.eta_seconds ?? null,
+          filesDone: ev.files_done || 0,
+          filesTotal: ev.files_total || 0,
+        },
+      },
+    };
+  }
+  if (!ev.filename) return prev;
+  const files = {
+    ...cur.files,
+    [ev.filename]: {
+      downloaded: ev.downloaded || 0,
+      total: ev.total || 0,
+      rate: ev.rate || 0,
+    },
+  };
+  return { ...prev, [key]: { ...cur, files } };
+}
+
+/**
+ * Repo ids whose install failed because the CONFIGURED Hugging Face mirror is
+ * unreachable (#874 class). Non-empty → the wizard shows the inline mirror
+ * picker next to the failed rows: during first-run the Settings panel the
+ * error hint names is unreachable (the wizard gates the studio), so the
+ * switch-and-retry affordance must live right here. Pure + exported for tests.
+ */
+export function mirrorBlockedRepos(progress) {
+  return Object.entries(progress || {})
+    .filter(([, p]) => p?.phase === 'install_error' && p?.docsTopic === 'HF_MIRROR_UNREACHABLE')
+    .map(([key]) => key.split('\u0000').at(-1));
+}
+
 // LED dot tone per row state.
 const LED_TONE = {
   ok: 'bg-success shadow-[0_0_5px_1px_color-mix(in_srgb,var(--color-success)_50%,transparent)]',
@@ -110,7 +208,7 @@ const LED_TONE = {
 // Chip Badge tone per chip category.
 const CHIP_TONE = { req: 'brand', rec: 'success', eng: 'neutral', opt: 'neutral' };
 
-function Row({ led, name, chip, chipTone, size, action, sub }) {
+function Row({ led, name, chip, chipTone, chipTitle, size, action, sub }) {
   return (
     <div className="flex items-center gap-3 rounded-md px-3 py-2 transition-colors hover:bg-bg-elev-3">
       <span
@@ -121,7 +219,7 @@ function Row({ led, name, chip, chipTone, size, action, sub }) {
         <span className="flex items-center gap-2 text-sm font-semibold">
           {name}
           {chip && (
-            <Badge tone={CHIP_TONE[chipTone] || 'neutral'} size="xs">
+            <Badge tone={CHIP_TONE[chipTone] || 'neutral'} size="xs" title={chipTitle}>
               {chip}
             </Badge>
           )}
@@ -138,7 +236,9 @@ export default function WizardLibrary() {
   const { t } = useTranslation();
   const modelsQuery = useModels();
   const installMutation = useInstallModel();
-  const [engines, setEngines] = useState(null);
+  const { data: engineInventory } = useEngines();
+  const selectMutation = useSelectEngine();
+  const engines = engineInventory?.tts ?? null;
   const [progress, setProgress] = useState({}); // { repo_id: { phase, files } }
   const [showTail, setShowTail] = useState(false);
   const [switching, setSwitching] = useState(null);
@@ -156,22 +256,6 @@ export default function WizardLibrary() {
     return Array.isArray(d) ? [] : (d?.platform_tags ?? []);
   }, [modelsQuery.data]);
 
-  // Engines: TTS family only on first run — the family the studio speaks with.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const all = await listEngines();
-        if (!cancelled) setEngines(all?.tts ?? null);
-      } catch {
-        /* backend mid-boot — the wizard polls models anyway */
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   // One SSE stream for all rows (same channel the Settings store uses).
   useEffect(() => {
     const es = new EventSource(setupDownloadStreamUrl());
@@ -180,52 +264,13 @@ export default function WizardLibrary() {
       try {
         const ev = JSON.parse(evt.data);
         if (!ev?.repo_id) return;
-        setProgress((prev) => {
-          const cur = prev[ev.repo_id] || { phase: 'active', files: {} };
-          // Lifecycle markers (`install_*`) gate reset/refetch; per-file tqdm
-          // phases ('start'|'progress'|'done') only update byte counts — a
-          // file-level 'done' must NOT clear the repo, multi-file snapshots
-          // finish files long before the repo's `install_done` arrives.
-          // (Full phase taxonomy: SetupProgressEvent in api/setup.ts.)
-          if (ev.phase === 'install_start')
-            return { ...prev, [ev.repo_id]: { phase: 'active', files: {} } };
-          if (ev.phase === 'install_done' || ev.phase === 'install_error') {
-            if (ev.phase === 'install_done') modelsQuery.refetch();
-            const next = { ...prev };
-            delete next[ev.repo_id];
-            return next;
-          }
-          // Authoritative overall progress (download_aggregator): one windowed
-          // rate + ETA + bytes_done/total_bytes for the whole repo. Preferred
-          // over summing per-file events, which is unreliable under parallel/
-          // segmented fetch (the source of the "8% · 1 KB/s · 0.0 MB left" bug).
-          if (ev.phase === 'aggregate') {
-            return {
-              ...prev,
-              [ev.repo_id]: {
-                ...cur,
-                agg: {
-                  bytesDone: ev.bytes_done || 0,
-                  totalBytes: ev.total_bytes || 0,
-                  rate: ev.rate || 0,
-                  etaSeconds: ev.eta_seconds ?? null,
-                  filesDone: ev.files_done || 0,
-                  filesTotal: ev.files_total || 0,
-                },
-              },
-            };
-          }
-          if (!ev.filename) return prev;
-          const files = {
-            ...cur.files,
-            [ev.filename]: {
-              downloaded: ev.downloaded || 0,
-              total: ev.total || 0,
-              rate: ev.rate || 0,
-            },
-          };
-          return { ...prev, [ev.repo_id]: { ...cur, files } };
-        });
+        // Refetch the list once the repo finishes so the row flips to installed.
+        // (The reducer is pure — the side-effect stays here.)
+        if (ev.phase === 'install_done') modelsQuery.refetch();
+        // Pure reducer (exported for tests). Full phase taxonomy:
+        // SetupProgressEvent in api/setup.ts. install_error now PERSISTS with
+        // its message instead of the row silently vanishing (P1-A).
+        setProgress((prev) => reduceWizardDownloadEvent(prev, ev));
       } catch {
         /* keepalive */
       }
@@ -235,13 +280,14 @@ export default function WizardLibrary() {
   }, []);
 
   const install = (repoId) => {
-    setProgress((p) => ({ ...p, [repoId]: { phase: 'active', files: {} } }));
+    const key = `local\u0000${repoId}`;
+    setProgress((p) => ({ ...p, [key]: { phase: 'active', files: {} } }));
     installMutation.mutate(repoId, {
       onError: (e) => {
         toast.error(e?.message || 'install failed');
         setProgress((p) => {
           const n = { ...p };
-          delete n[repoId];
+          delete n[key];
           return n;
         });
       },
@@ -251,8 +297,10 @@ export default function WizardLibrary() {
   const useEngine = async (id) => {
     setSwitching(id);
     try {
-      const r = await selectEngine('tts', id);
-      setEngines((e) => (e ? { ...e, active: r.active } : e));
+      const r = await selectMutation.mutateAsync({ family: 'tts', backendId: id });
+      // Consume the routing echo: warn when the pick lands on a CPU fallback
+      // on this host, otherwise confirm the switch. See notifyEngineSelected.
+      notifyEngineSelected(r, t, 'tts');
     } catch (e) {
       toast.error(e?.message || 'switch failed');
     } finally {
@@ -263,19 +311,23 @@ export default function WizardLibrary() {
   const supported = models.filter((m) => m.supported !== false);
   const required = supported.filter((m) => m.required);
   const optionalAll = supported.filter((m) => !m.required);
-  // Platform-tuned optionals lead (shown by default); the universal long tail
-  // still folds behind a quiet count.
-  const platformPicks = optionalAll.filter((m) => isPlatformPick(m, platformTags));
-  const tail = optionalAll.filter((m) => !isPlatformPick(m, platformTags));
+  // Curated "best for your system" optionals lead (shown by default with the
+  // recommended chip — same `curated` signal the Settings model store badges);
+  // the universal long tail still folds behind a quiet count.
+  const platformPicks = optionalAll.filter((m) => isRecommendedPick(m, platformTags));
+  const tail = optionalAll.filter((m) => !isRecommendedPick(m, platformTags));
 
-  const modelRow = (m, chip, chipTone, note) => {
-    const p = progress[m.repo_id];
+  const modelRow = (m, chip, chipTone, note, chipTitle) => {
+    const p = Object.entries(progress).find(([key]) => key.endsWith(`\u0000${m.repo_id}`))?.[1];
+    // A failed install PERSISTS (P1-A): show the mirror-aware reason + a Retry
+    // instead of the row silently vanishing.
+    const errored = p?.phase === 'install_error';
     // Prefer the backend's authoritative aggregate; fall back to per-file sums
     // only until that event arrives (then to nulls when nothing's streaming).
     const { pct, etaSec, rate, remaining } =
       progressFromAgg(p?.agg) ||
       (p ? aggregate(p.files) : { pct: null, etaSec: null, rate: 0, remaining: null });
-    const downloading = !!p;
+    const downloading = !!p && !errored;
     // Live telemetry line: "5.2 MB/s · 700 MB left · ~3m". Each part only shows
     // once the SSE stream has the data, so early on it degrades to "downloading…".
     const rateStr = fmtRate(rate);
@@ -296,9 +348,17 @@ export default function WizardLibrary() {
         name={m.label}
         chip={chip}
         chipTone={chipTone}
+        chipTitle={chipTitle}
         size={fmtGB(m.size_gb)}
         sub={
-          downloading ? (
+          errored ? (
+            <span className="block max-w-[520px] font-mono text-[0.64rem] leading-snug text-danger">
+              {t('firstrun.lib_install_failed', {
+                error: p.error,
+                defaultValue: 'Install failed: {{error}}',
+              })}
+            </span>
+          ) : downloading ? (
             <span className="block h-[3px] max-w-[280px] overflow-hidden rounded-full bg-fg/[0.08]">
               <span
                 className="block h-full rounded-full bg-primary transition-[width] duration-300"
@@ -312,6 +372,10 @@ export default function WizardLibrary() {
         action={
           m.installed ? (
             <Check size={14} className="shrink-0 text-success" aria-hidden="true" />
+          ) : errored ? (
+            <Button variant="ghost" size="sm" onClick={() => install(m.repo_id)}>
+              {t('firstrun.lib_retry', 'Retry')}
+            </Button>
           ) : downloading ? (
             <span className="shrink-0 font-mono text-[0.64rem] tabular-nums text-primary">
               {statParts.length
@@ -332,10 +396,17 @@ export default function WizardLibrary() {
     <div className="flex max-h-[min(56vh,620px)] flex-col gap-1 overflow-y-auto">
       {required.map((m) => modelRow(m, t('firstrun.chip_required', 'required'), 'req'))}
 
-      {/* Optional models tuned for THIS machine — shown by default with the
-          catalog note explaining why (e.g. "5× faster on Apple Silicon"). */}
+      {/* Curated optionals for THIS machine — shown by default with the
+          catalog note explaining why (e.g. "5× faster on Apple Silicon").
+          The chip tooltip spells out that these are optional. */}
       {platformPicks.map((m) =>
-        modelRow(m, t('firstrun.chip_recommended', 'recommended'), 'rec', m.note),
+        modelRow(
+          m,
+          t('firstrun.chip_recommended', 'recommended'),
+          'rec',
+          m.note,
+          t('firstrun.chip_recommended_title', 'Recommended for this machine — optional'),
+        ),
       )}
 
       {(engines?.backends ?? []).map((b) => (
@@ -388,6 +459,16 @@ export default function WizardLibrary() {
         </Button>
       )}
       {showTail && tail.map((m) => modelRow(m, t('firstrun.chip_optional', 'optional'), 'opt'))}
+      {/* A download failed because the CONFIGURED mirror is unreachable: the
+          error hint points at Settings, but the wizard gates the studio — so
+          the mirror picker renders right here. PUT /hf-mirror applies to
+          downloads immediately and clears the install cooldown, so the failed
+          rows retry the moment a new endpoint is applied. */}
+      {mirrorBlockedRepos(progress).length > 0 && (
+        <MirrorRescue
+          onApplied={() => mirrorBlockedRepos(progress).forEach((repoId) => install(repoId))}
+        />
+      )}
       {Object.keys(progress).length > 0 && (
         <p className="m-0 text-xs text-fg-subtle">
           {t(

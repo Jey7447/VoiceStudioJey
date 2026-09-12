@@ -86,6 +86,37 @@ describe('longformSlice — long-form fields', () => {
     expect(get().projectMode).toBe('stories');
   });
 
+  it('the output keeps its render-time lyrics snapshot and clears on newProject', () => {
+    // The finished render's filename used to be AudiobookTab useState — the
+    // Download affordance evaporated on the first tab switch.
+    const { get } = harness();
+    expect(get().lastOutput).toBe('');
+    get().setLastOutputSnapshot('audiobook_abc123.m4b', '# Rendered', [
+      { title: 'Rendered', status: 'done', duration_s: 3 },
+    ]);
+    expect(get().lastOutput).toBe('audiobook_abc123.m4b');
+    expect(get().lastOutputScript).toBe('# Rendered');
+    expect(get().lastOutputChapters).toEqual([
+      { title: 'Rendered', status: 'done', duration_s: 3 },
+    ]);
+    get().setScript('# Edited afterwards');
+    expect(get().lastOutputScript).toBe('# Rendered');
+    get().newProject('audiobook');
+    expect(get().lastOutput).toBe(''); // a new book doesn't show the old file
+    expect(get().lastOutputScript).toBe('');
+    expect(get().lastOutputChapters).toEqual([]);
+  });
+
+  it('loadProject clears lastOutput — no cross-project leak (#1139 review)', () => {
+    const { get } = harness();
+    get().setScript('# Book B');
+    get().saveProject('B');
+    const idB = get().currentProjectId;
+    get().setLastOutput('audiobook_from_a.m4b'); // pretend A rendered meanwhile
+    get().loadProject(idB);
+    expect(get().lastOutput).toBe(''); // loading B never presents A's render
+  });
+
   it('setProjectMeta MERGES; setLexicon REPLACES; setOutputPrefs merges', () => {
     const { get } = harness();
     get().setProjectMeta({ title: 'The Crown' });

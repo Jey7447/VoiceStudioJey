@@ -18,6 +18,8 @@ import { Badge } from '../../ui';
 import { SettingsSection } from './primitives';
 import Row from './Row';
 import PerformancePanel from './PerformancePanel';
+import ComputeDevicePanel from './ComputeDevicePanel';
+import GenerateBudgetPanel from './GenerateBudgetPanel';
 
 export default function PerformanceDeviceTab() {
   const { t } = useTranslation();
@@ -28,6 +30,10 @@ export default function PerformanceDeviceTab() {
   return (
     <>
       <PerformancePanel />
+
+      <ComputeDevicePanel />
+
+      <GenerateBudgetPanel />
 
       <SettingsSection
         icon={Gauge}
@@ -70,7 +76,13 @@ export default function PerformanceDeviceTab() {
                     : 'neutral'
               }
             >
-              {status?.status || 'unknown'}
+              {status?.status === 'ready'
+                ? t('models.ready_badge')
+                : status?.status === 'loading'
+                  ? t('models.loading_badge')
+                  : status?.status === 'idle'
+                    ? t('models.idle_badge')
+                    : status?.status || t('common.unknown', { defaultValue: 'unknown' })}
             </Badge>
           }
         />

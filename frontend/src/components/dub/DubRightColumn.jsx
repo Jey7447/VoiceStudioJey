@@ -1,11 +1,14 @@
-import { Suspense, lazy } from 'react';
-import { ChevronUp, ChevronDown, FileText } from 'lucide-react';
+import { Suspense, lazy, useState } from 'react';
+import { ChevronUp, ChevronDown, FileText, ClipboardPaste } from 'lucide-react';
 import { Button, Segmented } from '../../ui';
 import GlossaryPanel from '../GlossaryPanel';
 import CheckpointBanner from '../CheckpointBanner';
 import { LANG_CODES } from '../../utils/languages';
+import { autoProfileId } from '../../utils/segments';
+import { resolveDubDefaultTrack } from '../../utils/dubDefaultTrack';
 
 const DubSegmentTable = lazy(() => import('../DubSegmentTable'));
+const DubPasteTranslationDialog = lazy(() => import('./DubPasteTranslationDialog'));
 
 const LazyFallback = () => <div className="p-[12px] text-[#6b6657] text-[0.7rem]">Loading…</div>;
 
@@ -30,9 +33,16 @@ export default function DubRightColumn({
   defaultTrack,
   setDefaultTrack,
   dubLangCode,
+  multiLangMode,
+  batchTargets,
+  multiBatchBusy,
+  setDubLang,
+  setDubLangCode,
   dubTracks,
   timingStrategy,
   setTimingStrategy,
+  voiceMatch,
+  setVoiceMatch,
   dubTranscript,
   showTranscript,
   setShowTranscript,
@@ -65,13 +75,17 @@ export default function DubRightColumn({
   onDirectSegment,
   segmentSplit,
   segmentMerge,
+  segmentInsert,
+  segmentMoveResize,
   seekWaveform,
   timelineSelSegId,
   dubStep,
   dubProgress,
+  pasteTranslations,
 }) {
+  const [pasteOpen, setPasteOpen] = useState(false);
   return (
-    <div className="studio-panel dub-panel-col">
+    <div className="studio-panel dub-panel-col dub-panel-right">
       {/* Output options + timing — moved to the top of the right section. */}
       <div>
         <div className={OUT_ROW}>
@@ -107,7 +121,7 @@ export default function DubRightColumn({
             {t('dub.default_track')}
             <select
               className="input-base !text-[0.6rem] !px-[4px] !py-[2px] !w-[120px]"
-              value={defaultTrack}
+              value={resolveDubDefaultTrack(defaultTrack, dubLangCode, dubTracks)}
               onChange={(e) => setDefaultTrack(e.target.value)}
             >
               <option value="original">{t('dub.original_track')}</option>
@@ -152,9 +166,30 @@ export default function DubRightColumn({
               },
               {
                 value: 'strict_slot',
-                label: 'Strict slot',
-                title:
-                  'Legacy: compress audio to fit the original timing. Can sound rushed/chipmunky on high-density target languages.',
+                label: t('dub.timing_lip_sync'),
+                title: t('dub.timing_lip_sync'),
+              },
+            ]}
+          />
+        </div>
+        {/* Voice match — whether each line clones from its own source clip
+            (best prosody, identity may drift) or every line of a speaker
+            shares ONE reference (steady identity). */}
+        <div className={OUT_ROW} title={t('dub.voice_match_title')}>
+          <span className={OUT_TITLE}>{t('dub.voice_match')}</span>
+          <Segmented
+            value={voiceMatch}
+            onChange={setVoiceMatch}
+            items={[
+              {
+                value: 'per_line',
+                label: t('dub.voice_match_per_line'),
+                title: t('dub.voice_match_per_line_title'),
+              },
+              {
+                value: 'consistent',
+                label: t('dub.voice_match_consistent'),
+                title: t('dub.voice_match_consistent_title'),
               },
             ]}
           />
@@ -234,7 +269,7 @@ export default function DubRightColumn({
             {speakerClones && Object.keys(speakerClones).length > 0 && (
               <optgroup label={t('dub.cast')}>
                 {Object.keys(speakerClones).map((spk) => {
-                  const autoId = `auto:${(spk || '').toLowerCase().replace(/\s+/g, '_')}`;
+                  const autoId = autoProfileId(spk);
                   return (
                     <option key={autoId} value={autoId}>
                       🎤 {spk}
@@ -301,6 +336,58 @@ export default function DubRightColumn({
         />
       )}
 
+      {multiLangMode && batchTargets?.length > 1 && (
+        <label className="mb-[4px] flex max-w-[320px] items-center gap-[7px] px-[2px]">
+          <span className={OUT_TITLE}>{t('dub.language')}:</span>
+          <select
+            className="input-base min-w-0 flex-1 !px-[7px] !py-[3px] !text-[0.68rem]"
+            value={dubLangCode}
+            disabled={multiBatchBusy}
+            aria-label={t('dub.language')}
+            onChange={(event) => {
+              const target = batchTargets.find((item) => item.code === event.target.value);
+              if (!target) return;
+              setDubLang(target.lang);
+              setDubLangCode(target.code);
+            }}
+          >
+            {batchTargets.map((target) => (
+              <option key={target.code} value={target.code}>
+                {target.lang} · {target.code.toUpperCase()}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+
+      {/* Segment-table toolbar. "Paste translation" is the manual counterpart
+          to Translate All: the user translated elsewhere (ChatGPT/DeepL/a
+          human) and pastes the result onto the timing we already have. */}
+      {pasteTranslations && (
+        <div className="flex items-center justify-end mb-[4px]">
+          <Button
+            variant="subtle"
+            size="sm"
+            onClick={() => setPasteOpen(true)}
+            disabled={!dubSegments.length}
+            title={t('dub.paste_translation_title')}
+            leading={<ClipboardPaste size={10} />}
+          >
+            {t('dub.paste_translation_btn')}
+          </Button>
+        </div>
+      )}
+      {pasteOpen && (
+        <Suspense fallback={null}>
+          <DubPasteTranslationDialog
+            open
+            segments={dubSegments}
+            onApply={pasteTranslations}
+            onClose={() => setPasteOpen(false)}
+          />
+        </Suspense>
+      )}
+
       <Suspense fallback={<LazyFallback />}>
         <DubSegmentTable
           segments={dubSegments}
@@ -320,6 +407,8 @@ export default function DubRightColumn({
           onDirect={onDirectSegment}
           onSplit={segmentSplit}
           onMerge={segmentMerge}
+          onInsert={segmentInsert}
+          onMoveResize={segmentMoveResize}
           onSeek={seekWaveform}
           timelineSelectedId={timelineSelSegId}
         />

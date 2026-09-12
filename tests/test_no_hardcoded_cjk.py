@@ -50,12 +50,14 @@ _ALLOWED_FILES = {
     "README_CN.md",                               # Chinese README (a translation)
     "docs/data_preparation.md",                   # multilingual example payloads
     "docs/voice-design.md",                       # EN/CJK attribute mapping table
+    "docs/engines/omnivoice.md",                  # pinyin pronunciation-control example (functional CJK)
     "docs/superpowers/specs/2026-05-31-voice-gallery-design.md",  # Chinese-dialect taxonomy reference table
     "examples/README.md",                         # multilingual example payloads
     # Text-processing (CJK punctuation inside sentence/clause-splitting regexes)
     "backend/services/segmentation.py",
     "backend/services/sentence_chunker.py",       # streaming-TTS terminator tables (Patter port, Wave 1.4)
     "backend/services/subtitle_segmenter.py",
+    "backend/core/http_headers.py",               # docstring quotes the CJK filename that 500'd the header (#1262)
     "frontend/src/components/DubSegmentRow.jsx",
     "frontend/src/components/StoriesEditor.jsx",
     "frontend/src/utils/voiceInstruct.js",
@@ -75,13 +77,18 @@ _ALLOWED_FILES = {
     # WER evaluation data
     "omnivoice/eval/wer/fleurs.py",
     "omnivoice/eval/wer/punctuations.lst",
-    # CLI / legacy research UI (bilingual demo labels; not the shipped app)
+    # CLI demo (bilingual demo labels; not the shipped app)
     "omnivoice/cli/demo.py",
-    "research/legacy_gradio/ui.py",
-    "research/legacy_gradio/ui_local.py",
     # Demo-audio generation scripts (multilingual TTS sample text)
     "scripts/build_demos.sh",
     "scripts/build_dub_demo.sh",
+    "scripts/dub_demo_scripts.json",              # the five dub paragraphs + their native language labels
+    # Rendered dubbing-demo bundle: the demo IS a dub into Chinese and
+    # Japanese, so its subtitles and manifest carry that text as data. Not UI
+    # strings — nothing here is translated, it is the content being shown.
+    "backend/assets/samples/demo/dubbing/dubbed_zh.srt",
+    "backend/assets/samples/demo/dubbing/dubbed_ja.srt",
+    "backend/assets/samples/demo/dubbing/manifest.json",
 }
 
 

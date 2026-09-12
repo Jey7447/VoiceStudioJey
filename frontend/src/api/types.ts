@@ -24,23 +24,88 @@ type EffectiveDevice = GPUTarget | 'network';
 // `n/a` is LLM-only; resolve_routing only ever returns the first four.
 type RoutingStatus = 'accelerated' | 'cpu_fallback' | 'cpu_only' | 'unavailable' | 'n/a';
 
-interface EngineBackend {
+export interface EngineBackend {
   id: string;
   display_name: string;
   available: boolean;
   reason: string | null;
+  // Available-but-has-advice: the backend's `is_available()` returned ok with
+  // an advisory tail ("ready — <advice>", e.g. VoxCPM2's upgrade hint). Null
+  // for plain-ready and unavailable rows; absent on legacy payloads.
+  hint?: string | null;
+  // Cloning capability (TTS family): true/false from the backend class, null
+  // when model-dependent (mlx-audio's curated models differ). Only badge on
+  // an explicit true.
+  supports_cloning?: boolean | null;
+  // Graded-emotion capability (#1208) — the Audiobook expressive panel shows
+  // emotion controls only when the active engine sets this. Absent on legacy
+  // payloads (treated as false).
+  supports_emotion?: boolean;
   install_hint?: string | null;
+  // Copy-paste-ready `export VAR=...` line for a path-gated opt-in engine
+  // (IndexTTS / MOSS-v1.5 / dots.tts / Confucius4), else null/absent.
+  setup_snippet?: string | null;
+  // True when the backend's sidecar provisioner can install this engine
+  // in-app (Settings renders an Install button; the manual snippet is
+  // demoted to a collapsible fallback). Absent on legacy payloads.
+  one_click_install?: boolean;
   last_error?: string | null;
   isolation_mode?: 'in-process' | 'subprocess';
   gpu_compat?: GPUTarget[];
+  // Approximate VRAM (GB) the engine wants on a dedicated GPU; null when the
+  // engine declares no meaningful floor (#1226). Advisory metadata — when the
+  // host has less, `routing_reason` carries the caveat and the matrix renders
+  // it under an otherwise-accelerated row.
+  min_vram_gb?: number | null;
   // Routing (#21) — the device this engine uses on this machine + why.
   effective_device?: EffectiveDevice;
   routing_status?: RoutingStatus;
   routing_reason?: string | null;
+  // #981 — mlx-audio ONLY: it multiplexes 7+ curated models behind one
+  // backend id, so its entry also carries the roster + current pick so
+  // Settings can render a model picker. Absent on every other backend.
+  curated_models?: CuratedModel[];
+  active_model_id?: string;
+  disk_usage?: EngineDiskUsage;
 }
 
-interface EngineFamilyResponse {
+export interface EngineDiskEstimate {
+  model_download_bytes: number | null;
+  package_download_bytes: number | null;
+  unique_installed_bytes: number | null;
+  potentially_shared_bytes: number | null;
+  temporary_free_bytes: number | null;
+  confidence: 'exact' | 'measured' | 'estimated' | 'unknown';
+  destination: string;
+  destination_volume: string;
+  deduplication: string | null;
+}
+
+export interface EngineDiskActual {
+  model_bytes: number | null;
+  environment_bytes: number | null;
+  cache_bytes: number | null;
+  total_owned_bytes: number | null;
+  confidence: 'measured' | 'unknown';
+}
+
+export interface EngineDiskUsage {
+  estimate: EngineDiskEstimate;
+  actual: EngineDiskActual;
+}
+
+// #981 — one of mlx-audio's curated models (see backend
+// MLXAudioBackend.CURATED_MODELS / _MLX_AUDIO_MODEL_LABELS).
+export interface CuratedModel {
+  key: string;
+  label: string;
+  repo_id: string;
+}
+
+export interface EngineFamilyResponse {
   active: string;
+  /** A process environment pin wins over a saved UI selection. */
+  env_override?: boolean;
   backends: EngineBackend[];
 }
 
@@ -54,6 +119,12 @@ export interface SelectEngineResponse {
   family: EngineFamily;
   active: string;
   env_override: boolean;
+  // Routing verdict for the picked engine on THIS host (#21) — the select echo
+  // the post-select toast reads to warn on a cpu_fallback pick. Optional so a
+  // legacy payload without them still types cleanly.
+  routing_status?: RoutingStatus;
+  effective_device?: EffectiveDevice;
+  routing_reason?: string | null;
 }
 
 export interface EngineHealthResponse {
@@ -61,6 +132,20 @@ export interface EngineHealthResponse {
   ok: boolean;
   message: string;
   latency_ms: number;
+}
+
+// Real-synthesis self-test result for an available in-process TTS engine
+// (POST /engines/{id}/selftest). `ok` proves the engine emitted audio; the
+// rest quantify it. `timed_out` marks a synth that outran the bounded timeout.
+export interface EngineSelfTestResponse {
+  id: string;
+  ok: boolean;
+  message: string;
+  duration_ms: number;
+  sample_rate?: number | null;
+  num_samples?: number | null;
+  audio_seconds?: number | null;
+  timed_out?: boolean;
 }
 
 // ── System / diagnostics ─────────────────────────────────────────────────
@@ -118,9 +203,12 @@ export interface Profile {
   id: string;
   name: string;
   kind: ProfileKind;
+  language?: string;
   language_code?: string;
   ref_audio?: string;
   ref_text?: string;
+  instruct?: string;
+  vd_states?: string | null;
   description?: string;
   created_at?: string;
   is_locked?: boolean;
@@ -208,6 +296,17 @@ export interface DubTranslateResponse {
     text_original?: string;
     rate_ratio?: number;
     rate_error?: string;
+    /** Pre-synthesis duration plan (backend services/duration_planner.py). */
+    plan?: {
+      status: 'fits' | 'tight' | 'impossible';
+      est_dur_s: number;
+      available_s: number;
+      est_overrun_s: number;
+      calibrated: boolean;
+      /** Opt-in LLM condensation suggestion (request condense=true only). */
+      suggested_text?: string;
+      suggested_est_dur_s?: number;
+    };
   }[];
 }
 

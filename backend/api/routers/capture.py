@@ -8,8 +8,11 @@ raw audio bytes and get back transcribed text immediately.  Used by:
     • The MCP server's future `transcribe_audio` tool
     • CLI consumers that just want speech-to-text
 
-The ASR engine is whatever `get_active_asr_backend()` returns — WhisperX
-by default, or MLX Whisper on Apple Silicon when configured.
+The ASR engine is whatever `load_active_asr_backend()` returns — WhisperX
+by default, or MLX Whisper on Apple Silicon when configured. The *loader*,
+not the bare selector: it also runs `ensure_loaded()` and falls through to
+the next healthy engine when the selected one has a broken deep import chain
+(#1185), which the shallow `is_available()` probe cannot see.
 """
 from __future__ import annotations
 
@@ -79,12 +82,30 @@ async def transcribe_audio(
 
         use_accurate = (mode or "").strip().lower() == "accurate"
 
+        # TTS-only install: no ASR model on disk → typed 409 with a download
+        # CTA, BEFORE any backend is constructed (the whisper backends
+        # auto-download multi-GB weights from HF on first load).
+        from services.asr_backend import asr_model_missing_detail, asr_model_missing_error
+        missing = await asyncio.to_thread(
+            asr_model_missing_error,
+            purpose="transcribe" if use_accurate else "dictation",
+        )
+        if missing is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={**missing, "message": asr_model_missing_detail(missing)},
+            )
+
         def _run():
             if use_accurate:
                 # Accurate mode: full WhisperX with forced alignment —
                 # for when the user explicitly wants word-level timing.
-                from services.asr_backend import get_active_asr_backend
-                backend = get_active_asr_backend()
+                # `load_*`, not `get_*`: the selector alone hands back an
+                # engine whose shallow probe passed but whose deep import
+                # chain is broken, which then 500s at `.transcribe()`. The
+                # loader degrades to the next healthy engine (#1185).
+                from services.asr_backend import load_active_asr_backend
+                backend = load_active_asr_backend()
                 result = backend.transcribe(tmp.name, word_timestamps=True)
             else:
                 # Fast mode (default): use the fastest available engine
@@ -96,7 +117,11 @@ async def transcribe_audio(
             return result, backend.id
 
         from services.model_manager import _gpu_pool
-        from services.asr_backend import ASRTimeoutError, run_transcribe_guarded
+        from services.asr_backend import (
+            ASRModelMissingError,
+            ASRTimeoutError,
+            run_transcribe_guarded,
+        )
         t0 = time.perf_counter()
         try:
             result, engine_id = await run_transcribe_guarded(
@@ -107,6 +132,14 @@ async def transcribe_audio(
             # silent hang the UI reads as "can't reach the local backend".
             logger.warning("Capture transcription timed out: %s", e)
             raise HTTPException(status_code=504, detail=str(e))
+        except ASRModelMissingError as e:
+            # Degraded past the broken engine onto one with no weights on
+            # disk — same typed 409 (+ download CTA) as the preflight above,
+            # never a 500 and never a silent multi-GB auto-download.
+            raise HTTPException(
+                status_code=409,
+                detail={**e.payload, "message": asr_model_missing_detail(e.payload)},
+            )
         elapsed = round(time.perf_counter() - t0, 2)
 
         # Normalize result shape
@@ -119,6 +152,15 @@ async def transcribe_audio(
         # Segments keep the raw recognition so their timings stay truthful.
         from services.refinement import collapse_repetitive_artifacts
         full_text = collapse_repetitive_artifacts(full_text)
+
+        # Cross-transport parity: deterministically polish the final text
+        # (leading capital + terminal punctuation) exactly like the live
+        # dictation socket (capture_ws) does, so the widget's POST fallback and
+        # MCP/CLI callers get the same typed-looking result the WS returns —
+        # not the raw "...test" the REST path used to leak. Segments stay raw
+        # (their timings/verbatim recognition are the contract).
+        from services.text_polish import polish_text
+        full_text = polish_text(full_text)
 
         # Calculate audio duration from segments if available
         duration = 0.0
@@ -135,8 +177,12 @@ async def transcribe_audio(
         if _truthy(refine) and full_text:
             from services.refinement import maybe_refine
             refined = await asyncio.to_thread(maybe_refine, full_text)
-            if refined and refined != full_text:
-                refined_text = refined
+            if refined:
+                # Polish the refined text too, so both surfaced strings read as
+                # typed text (mirrors the raw-vs-refined contract of the WS).
+                refined = polish_text(refined)
+                if refined != full_text:
+                    refined_text = refined
 
         logger.info(
             "Capture transcription done: engine=%s, elapsed=%.2fs, duration=%.1fs, mode=%s, refined=%s",

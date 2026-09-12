@@ -1,5 +1,5 @@
 /**
- * Settings → System → LLM Providers (v0.3.8).
+ * Settings → System → LLM Providers (v0.3.8; test/UX/i18n pass for v0.3.9).
  *
  * One place to configure the high-quality LLM that powers Cinematic and
  * Autofit translation (fitting each line to its segment's time budget). Every
@@ -13,15 +13,23 @@
  *         notes,base_url,model,has_key,key_from_env,configured}]}
  *   PUT  /api/settings/llm-providers/{id}  {api_key?,base_url?,model?,account_id?,make_active?}
  *   POST /api/settings/llm-providers/active {provider}
- *   POST /api/settings/llm-providers/{id}/test → {ok, model?, reply?, detail?}
+ *   POST /api/settings/llm-providers/{id}/test
+ *     → {ok, model?, reply?, latency_ms?, kind?, detail?}   (kind: config|auth|
+ *       not_found|rate_limit|network|error → localized message below)
+ *   GET  /api/settings/llm-providers/{id}/models → {ok, models[], kind?}
  */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Brain, ExternalLink } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 import { apiJson, apiFetch, apiPost } from '../../api/client';
+import { useAppStore } from '../../store';
 import { SettingsSection, SettingRow, SettingsInput } from './primitives';
 import { Button, Badge, Select } from '../../ui';
 
+const MODELS_DATALIST_ID = 'llm-provider-models-list';
+
 export default function LLMProvidersPanel() {
+  const { t } = useTranslation();
   const [providers, setProviders] = useState([]);
   const [active, setActive] = useState(null);
   const [editing, setEditing] = useState('');
@@ -29,20 +37,51 @@ export default function LLMProvidersPanel() {
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [test, setTest] = useState(null);
+  const [models, setModels] = useState(null); // null = not fetched; [] = fetched, none
+  const [modelsTruncated, setModelsTruncated] = useState(false);
+  const [loadingModels, setLoadingModels] = useState(false);
   const [error, setError] = useState(null);
+  // True after a save/Test whose provider is still NOT the active one — the
+  // save persisted fine but translation keeps using another provider, so be
+  // honest about it instead of letting a green Test read as "done" (#963).
+  const [savedInactive, setSavedInactive] = useState(false);
 
   const current = useMemo(
     () => providers.find((p) => p.id === editing) || null,
     [providers, editing],
   );
 
+  // Failure kinds from /test and /models → localized, actionable messages.
+  const kindMessage = useCallback(
+    (res) => {
+      const byKind = {
+        config: t('settings.llmp_err_config'),
+        auth: t('settings.llmp_err_auth'),
+        not_found: t('settings.llmp_err_not_found'),
+        rate_limit: t('settings.llmp_err_rate_limit'),
+        network: t('settings.llmp_err_network'),
+      };
+      return byKind[res?.kind] || res?.detail || t('settings.llmp_err_error');
+    },
+    [t],
+  );
+
   const populate = useCallback((list, id) => {
     const p = list.find((x) => x.id === id);
     if (!p) return;
-    // base_url/model prefill with the resolved value so the user edits from a
-    // sane default; api_key is never echoed (only the has_key flag comes back).
-    setFields({ base_url: p.base_url || '', model: p.model || '', api_key: '', account_id: '' });
+    // base_url/model/account prefill with the resolved value so the user edits
+    // from a sane default; api_key is never echoed (only the has_key flag
+    // comes back). account_id round-trips so a saved Cloudflare id is visible.
+    setFields({
+      base_url: p.base_url || '',
+      model: p.model || '',
+      api_key: '',
+      account_id: p.account_id || '',
+    });
     setTest(null);
+    setModels(null);
+    setModelsTruncated(false);
+    setSavedInactive(false);
   }, []);
 
   const refresh = useCallback(
@@ -62,10 +101,10 @@ export default function LLMProvidersPanel() {
         populate(data.providers || [], pick);
         return data;
       } catch (e) {
-        setError(e?.message || 'Failed to load providers');
+        setError(e?.message || t('settings.llmp_load_failed'));
       }
     },
-    [populate],
+    [populate, t],
   );
 
   useEffect(() => {
@@ -77,8 +116,11 @@ export default function LLMProvidersPanel() {
     populate(providers, id);
   };
 
+  // Returns true when the PUT (and refresh) succeeded — Test / Fetch models
+  // gate on it so they never probe the previously-stored config after a
+  // failed save (which could show a green "Test ok" beside a save error).
   const save = async (makeActive) => {
-    if (!current) return;
+    if (!current) return false;
     setSaving(true);
     setError(null);
     try {
@@ -94,9 +136,16 @@ export default function LLMProvidersPanel() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      await refresh(current.id);
+      const data = await refresh(current.id);
+      // Saved but another provider stays active → say so (populate() above
+      // cleared the previous notice). Suppress while LLM_DEFAULT_PROVIDER
+      // pins the choice — the env banner already explains and the suggested
+      // button is disabled.
+      setSavedInactive(Boolean(data) && data.active !== current.id && !current.active_from_env);
+      return true;
     } catch (e) {
-      setError(e?.message || 'Failed to save');
+      setError(e?.message || t('settings.llmp_save_failed'));
+      return false;
     } finally {
       setSaving(false);
     }
@@ -108,27 +157,64 @@ export default function LLMProvidersPanel() {
     setTest(null);
     setError(null);
     try {
-      // Save first so the probe sees the just-typed key/URL.
-      await save(false);
+      // Save first so the probe sees the just-typed key/URL. If the save
+      // failed, stop: probing the stale stored config would contradict the
+      // save error with a misleading green badge.
+      if (!(await save(false))) return;
       const res = await apiPost(`/api/settings/llm-providers/${current.id}/test`);
       setTest(res);
     } catch (e) {
-      setTest({ ok: false, detail: e?.message || 'Test failed' });
+      setTest({ ok: false, detail: e?.message || t('settings.llmp_err_error') });
     } finally {
       setTesting(false);
     }
   };
 
+  const fetchModels = async () => {
+    if (!current) return;
+    setLoadingModels(true);
+    setError(null);
+    try {
+      // Save non-key fields first so the probe uses the just-typed base URL;
+      // abort on a failed save (same stale-config trap as runTest).
+      if (!(await save(false))) return;
+      const res = await apiJson(`/api/settings/llm-providers/${current.id}/models`);
+      if (res.ok) {
+        setModels(res.models || []);
+        setModelsTruncated(!!res.truncated);
+      } else {
+        setModels([]);
+        setModelsTruncated(false);
+        setTest({ ok: false, kind: res.kind, detail: res.detail });
+      }
+    } catch (e) {
+      setModels([]);
+      setTest({ ok: false, detail: e?.message || t('settings.llmp_err_error') });
+    } finally {
+      setLoadingModels(false);
+    }
+  };
+
   if (!providers.length) {
+    // A failed initial GET used to dead-end here (nothing re-runs refresh
+    // without a remount) — the Retry button is the way back in.
     return (
       <SettingsSection
         icon={Brain}
-        title="LLM Providers"
-        description="Configure a high-quality LLM for Cinematic & Autofit translation."
+        title={t('settings.llm_providers')}
+        description={t('settings.llmp_desc')}
       >
         {error && (
           <div className="perfpanel__error" role="alert">
-            {error}
+            <span className="mr-[8px]">{error}</span>
+            <Button
+              variant="subtle"
+              size="sm"
+              onClick={() => refresh()}
+              data-testid="llm-provider-retry"
+            >
+              {t('settings.retry', { defaultValue: 'Retry' })}
+            </Button>
           </div>
         )}
       </SettingsSection>
@@ -140,12 +226,25 @@ export default function LLMProvidersPanel() {
   return (
     <SettingsSection
       icon={Brain}
-      title="LLM Providers"
-      description="Powers Cinematic & Autofit translation — the LLM rewrites each line to fit its segment's time budget so the video timing holds. Keys are stored encrypted; local providers (Ollama/LM Studio) stay fully offline."
+      title={t('settings.llm_providers')}
+      description={t('settings.llmp_desc')}
     >
+      {/* Backlink half of the catalogue↔providers door: the provider picked
+          here is what the catalogue's LLM family actually calls through. */}
+      <p className="m-0 text-[length:var(--text-xs)] text-[color:var(--chrome-fg-muted)]">
+        {t('settings.llmp_catalogue_note')}{' '}
+        <button
+          type="button"
+          className="cursor-pointer border-0 bg-transparent p-0 text-[length:var(--text-xs)] text-[color:var(--chrome-accent)] underline-offset-2 hover:underline"
+          onClick={() => useAppStore.getState().openCatalogue?.({ pane: 'engines', family: 'llm' })}
+          data-testid="llmp-open-catalogue"
+        >
+          {t('settings.llmp_catalogue_link')}
+        </button>
+      </p>
       <SettingRow
-        title="Provider"
-        hint="Pick a provider to configure. The active one is used for Cinematic/Autofit translation. Local providers need no key but require their server to be running."
+        title={t('settings.llmp_provider')}
+        hint={t('settings.llmp_provider_hint')}
         control={
           <Select
             value={editing}
@@ -155,9 +254,9 @@ export default function LLMProvidersPanel() {
             {providers.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.display_name}
-                {p.local ? ' · local' : ''}
+                {p.local ? ` · ${t('settings.llmp_local_tag')}` : ''}
                 {p.configured ? ' ✓' : ''}
-                {active === p.id ? ' (active)' : ''}
+                {active === p.id ? ` (${t('settings.llmp_active_badge')})` : ''}
               </option>
             ))}
           </Select>
@@ -168,7 +267,7 @@ export default function LLMProvidersPanel() {
         <>
           {(current.notes || current.signup_url) && (
             <SettingRow
-              title="About"
+              title={t('settings.llmp_about')}
               control={
                 <div className="flex flex-col gap-[4px] min-w-0">
                   {current.notes && <span className="text-[12px] opacity-70">{current.notes}</span>}
@@ -179,7 +278,7 @@ export default function LLMProvidersPanel() {
                       rel="noreferrer"
                       className="text-[12px] inline-flex items-center gap-[4px] opacity-80 hover:opacity-100"
                     >
-                      Get an API key <ExternalLink size={12} />
+                      {t('settings.llmp_get_key')} <ExternalLink size={12} />
                     </a>
                   )}
                 </div>
@@ -189,14 +288,16 @@ export default function LLMProvidersPanel() {
 
           {current.needs_account && (
             <SettingRow
-              title="Account ID"
+              title={t('settings.llmp_account_id')}
+              note={current.account_from_env ? t('settings.llmp_env_override') : undefined}
               control={
                 <SettingsInput
                   mono
                   type="text"
                   value={fields.account_id}
                   onChange={(e) => setFields((f) => ({ ...f, account_id: e.target.value }))}
-                  placeholder="Cloudflare account id"
+                  placeholder={t('settings.llmp_account_placeholder')}
+                  disabled={current.account_from_env}
                   data-testid="llm-account-id"
                 />
               }
@@ -205,7 +306,7 @@ export default function LLMProvidersPanel() {
 
           {!current.local && (
             <SettingRow
-              title="API key"
+              title={t('settings.llmp_api_key')}
               control={
                 <SettingsInput
                   mono
@@ -214,10 +315,10 @@ export default function LLMProvidersPanel() {
                   onChange={(e) => setFields((f) => ({ ...f, api_key: e.target.value }))}
                   placeholder={
                     current.key_from_env
-                      ? 'set via environment (.env) — overrides this field'
+                      ? t('settings.llmp_key_env')
                       : current.has_key
-                        ? 'stored — type to replace'
-                        : 'paste your API key'
+                        ? t('settings.llmp_key_stored')
+                        : t('settings.llmp_key_paste')
                   }
                   disabled={current.key_from_env}
                   data-testid="llm-provider-key"
@@ -227,7 +328,8 @@ export default function LLMProvidersPanel() {
           )}
 
           <SettingRow
-            title="Base URL"
+            title={t('settings.llmp_base_url')}
+            note={current.base_url_from_env ? t('settings.llmp_env_override') : undefined}
             control={
               <SettingsInput
                 mono
@@ -235,21 +337,51 @@ export default function LLMProvidersPanel() {
                 value={fields.base_url}
                 onChange={(e) => setFields((f) => ({ ...f, base_url: e.target.value }))}
                 placeholder="https://api.provider.com/v1"
+                disabled={current.base_url_from_env}
                 data-testid="llm-provider-base-url"
               />
             }
           />
           <SettingRow
-            title="Model"
+            title={t('settings.llmp_model')}
+            note={current.model_from_env ? t('settings.llmp_env_override') : undefined}
+            hint={
+              models?.length
+                ? modelsTruncated
+                  ? t('settings.llmp_models_truncated', { count: models.length })
+                  : t('settings.llmp_models_loaded', { count: models.length })
+                : undefined
+            }
             control={
-              <SettingsInput
-                mono
-                type="text"
-                value={fields.model}
-                onChange={(e) => setFields((f) => ({ ...f, model: e.target.value }))}
-                placeholder="model name"
-                data-testid="llm-provider-model"
-              />
+              <div className="flex items-center gap-[8px] min-w-0">
+                <SettingsInput
+                  mono
+                  type="text"
+                  value={fields.model}
+                  onChange={(e) => setFields((f) => ({ ...f, model: e.target.value }))}
+                  placeholder={t('settings.llmp_model_placeholder')}
+                  list={models?.length ? MODELS_DATALIST_ID : undefined}
+                  disabled={current.model_from_env}
+                  data-testid="llm-provider-model"
+                />
+                <Button
+                  variant="subtle"
+                  size="sm"
+                  onClick={fetchModels}
+                  loading={loadingModels}
+                  disabled={saving || testing || loadingModels}
+                  data-testid="llm-provider-models"
+                >
+                  {t('settings.llmp_fetch_models')}
+                </Button>
+                {models?.length ? (
+                  <datalist id={MODELS_DATALIST_ID}>
+                    {models.map((m) => (
+                      <option key={m} value={m} />
+                    ))}
+                  </datalist>
+                ) : null}
+              </div>
             }
           />
 
@@ -259,8 +391,18 @@ export default function LLMProvidersPanel() {
             </div>
           )}
 
+          {current.active_from_env && (
+            <div
+              role="status"
+              data-testid="llm-active-env-banner"
+              className="text-[length:var(--text-xs)] text-[color:var(--chrome-fg-dim)] leading-[1.5] py-[var(--space-2)]"
+            >
+              {t('settings.llmp_active_env_pin')}
+            </div>
+          )}
+
           <SettingRow
-            title="Status"
+            title={t('settings.llmp_status')}
             control={
               <div className="flex flex-wrap items-center gap-[8px]">
                 <Button
@@ -271,17 +413,17 @@ export default function LLMProvidersPanel() {
                   disabled={saving || testing}
                   data-testid="llm-provider-save"
                 >
-                  Save
+                  {t('settings.llmp_save')}
                 </Button>
                 <Button
                   variant="primary"
                   size="sm"
                   onClick={() => save(true)}
                   loading={saving}
-                  disabled={saving || testing}
+                  disabled={saving || testing || current.active_from_env}
                   data-testid="llm-provider-activate"
                 >
-                  {isActive ? 'Save & keep active' : 'Save & use for translation'}
+                  {isActive ? t('settings.llmp_save_keep') : t('settings.llmp_save_active')}
                 </Button>
                 <Button
                   variant="subtle"
@@ -291,21 +433,36 @@ export default function LLMProvidersPanel() {
                   disabled={saving || testing}
                   data-testid="llm-provider-test"
                 >
-                  Test
+                  {t('settings.llmp_test')}
                 </Button>
                 {isActive && (
                   <Badge tone="success" dot role="status">
-                    active
+                    {t('settings.llmp_active_badge')}
                   </Badge>
                 )}
                 {test && (
                   <Badge tone={test.ok ? 'success' : 'warn'} role="status">
-                    {test.ok ? `ok — ${test.model || ''}` : test.detail || 'failed'}
+                    {test.ok
+                      ? t('settings.llmp_test_ok', {
+                          model: test.model || '',
+                          ms: test.latency_ms ?? '—',
+                        })
+                      : kindMessage(test)}
                   </Badge>
                 )}
               </div>
             }
           />
+
+          {savedInactive && (
+            <div
+              role="status"
+              data-testid="llm-not-active-notice"
+              className="text-[length:var(--text-xs)] text-[color:var(--chrome-fg-dim)] leading-[1.5] py-[var(--space-2)]"
+            >
+              {t('settings.llmp_saved_not_active')}
+            </div>
+          )}
         </>
       )}
     </SettingsSection>

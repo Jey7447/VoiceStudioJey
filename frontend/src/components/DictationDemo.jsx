@@ -2,7 +2,7 @@
  * DictationDemo — guided walkthrough for the real-time dictation feature.
  *
  * What this surfaces:
- *   1. Active hotkey display (read from the dictation_shortcut Tauri command).
+ *   1. Active hotkey display (including a portal-selected Wayland shortcut).
  *   2. Three script cards — short utterances the user can read aloud OR
  *      replay from a bundled WAV. The replay path posts the bundled audio
  *      to POST /transcribe and renders the recognized text below the card
@@ -24,6 +24,8 @@ import { useEffect, useRef, useState } from 'react';
 import { Play, Pause, Keyboard, Mic, CheckCircle2, AlertTriangle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { API, apiFetch } from '../api/client';
+import { asrMissingPayload, toastAsrModelMissing } from '../utils/asrModelMissing';
+import { useEffectiveDictationShortcut } from '../hooks/useEffectiveDictationShortcut';
 import { Button } from '../ui';
 
 // Shared status-pill base; per-state color/bg/border appended below. The gruvbox
@@ -61,8 +63,9 @@ function isTauri() {
 
 export default function DictationDemo({ embedded = false }) {
   const { t } = useTranslation();
-  const [shortcut, setShortcut] = useState('');
   const [hotkeyState, setHotkeyState] = useState('unknown'); // unknown | registered | verified
+  const desktop = isTauri();
+  const { info: shortcut } = useEffectiveDictationShortcut(desktop);
   const [playingId, setPlayingId] = useState(null);
   const [transcripts, setTranscripts] = useState({}); // {scriptId: {state, text, error}}
   // null = probing, true/false once the demo assets are confirmed present.
@@ -88,26 +91,12 @@ export default function DictationDemo({ embedded = false }) {
     };
   }, []);
 
-  // Read the registered hotkey on mount.
   useEffect(() => {
-    if (!isTauri()) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const { invoke } = await import('@tauri-apps/api/core');
-        const v = await invoke('get_dictation_shortcut');
-        if (!cancelled) {
-          setShortcut(v || '');
-          setHotkeyState(v ? 'registered' : 'unknown');
-        }
-      } catch {
-        if (!cancelled) setHotkeyState('unknown');
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    if (!desktop) return;
+    setHotkeyState((current) =>
+      current === 'verified' ? current : shortcut.backend === 'focused' ? 'unknown' : 'registered',
+    );
+  }, [desktop, shortcut.backend]);
 
   // Subscribe to dictation events: the moment the user presses their
   // hotkey while this panel is mounted, flip to verified.
@@ -180,9 +169,18 @@ export default function DictationDemo({ embedded = false }) {
         [script.id]: { state: 'ok', text: json.text || '', error: '' },
       }));
     } catch (e) {
+      // Typed 409 on a TTS-only install: no ASR model on disk. Render the
+      // human message + the one-click download CTA instead of the raw
+      // "409 Conflict: …" string.
+      const missing = asrMissingPayload(e);
+      if (missing) toastAsrModelMissing(missing);
       setTranscripts((prev) => ({
         ...prev,
-        [script.id]: { state: 'fail', text: '', error: e?.message || String(e) },
+        [script.id]: {
+          state: 'fail',
+          text: '',
+          error: missing ? t('asr_missing.message') : e?.message || String(e),
+        },
       }));
     }
   };
@@ -204,7 +202,7 @@ export default function DictationDemo({ embedded = false }) {
           >
             <Keyboard size={12} /> {t('demo.dictation_status_pending')}{' '}
             <code className="font-mono text-[10px] px-[4px] py-[1px] bg-[rgba(0,0,0,0.3)] rounded-[3px]">
-              {shortcut}
+              {shortcut.display}
             </code>
           </span>
         );

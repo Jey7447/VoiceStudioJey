@@ -23,6 +23,7 @@ def model_manager(monkeypatch):
             sys.modules.pop(mod_name, None)
 
     import services.model_manager as mm
+    from services import hf_revisions
 
     monkeypatch.setattr(mm, "_torch", None)
     monkeypatch.setattr(mm, "_OmniVoice", None)
@@ -33,6 +34,7 @@ def model_manager(monkeypatch):
     monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
     monkeypatch.setattr(mm, "_lazy_torch", lambda: SimpleNamespace(float16="float16"))
     monkeypatch.setattr(mm, "get_best_device", lambda: "cpu")
+    monkeypatch.setitem(hf_revisions.CURATED_REVISIONS, "test/checkpoint", "a" * 40)
     return mm
 
 
@@ -189,7 +191,7 @@ def test_repair_skipped_in_offline_mode(model_manager, monkeypatch):
     assert called == []  # no download attempted offline
 
 
-def test_repair_invokes_snapshot_download(model_manager, monkeypatch):
+def test_repair_invokes_snapshot_download(model_manager, monkeypatch, tmp_path):
     """Repair re-fetches the repo via snapshot_download (resume/fill missing)."""
     calls = []
 
@@ -198,10 +200,13 @@ def test_repair_invokes_snapshot_download(model_manager, monkeypatch):
         return "/cache/test/checkpoint"
 
     import huggingface_hub
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
     monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
 
     assert model_manager._repair_model_cache("test/checkpoint") is True
     assert calls and calls[0]["repo_id"] == "test/checkpoint"
+    assert calls[0]["revision"] == "a" * 40
+    assert calls[0]["cache_dir"] == str(tmp_path)
 
 
 def test_repair_returns_false_when_download_fails(model_manager, monkeypatch):
@@ -241,6 +246,71 @@ def test_repair_retries_then_succeeds(model_manager, monkeypatch):
     monkeypatch.setenv("OMNIVOICE_MODEL_REPAIR_RETRIES", "3")
     assert model_manager._repair_model_cache("test/checkpoint") is True
     assert attempts["n"] == 3
+
+
+def test_repair_failover_switches_endpoint_after_network_failure(model_manager, monkeypatch, tmp_path):
+    """Auto endpoint mode: a network-classified repair failure re-races the
+    endpoints ONCE and the next attempt retries on the winner — a dead
+    huggingface.co mid-repair heals onto the mirror instead of burning every
+    retry on it. Explicit endpoints are covered by test_endpoint_race."""
+    import huggingface_hub
+    import services.endpoint_race as er
+    from core import prefs
+
+    monkeypatch.setattr(prefs, "_PREFS_PATH", str(tmp_path / "prefs.json"))
+    monkeypatch.setattr(er, "_FAILOVER_ATTEMPTED", set())
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    monkeypatch.delenv("OMNIVOICE_HF_ENDPOINT_MODE", raising=False)
+    # The re-race finds canonical dead and the mirror alive.
+    monkeypatch.setattr(
+        er, "probe_endpoint",
+        lambda endpoint, timeout=None: er.ProbeResult(
+            endpoint=endpoint,
+            reachable=endpoint == er.COMMUNITY_MIRROR,
+            latency_ms=90.0 if endpoint == er.COMMUNITY_MIRROR else None,
+        ),
+    )
+
+    calls = []
+
+    def flaky(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("endpoint") != er.COMMUNITY_MIRROR:
+            raise OSError("connection reset by peer")  # network-classified
+        return "/cache/test/checkpoint"
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", flaky)
+    monkeypatch.setenv("OMNIVOICE_MODEL_REPAIR_BACKOFF_S", "0")
+    monkeypatch.setenv("OMNIVOICE_MODEL_REPAIR_RETRIES", "3")
+    assert model_manager._repair_model_cache("test/checkpoint") is True
+    # Attempt 1: canonical (no endpoint kwarg) fails → failover; attempt 2
+    # carries the mirror endpoint and succeeds.
+    assert "endpoint" not in calls[0]
+    assert calls[1]["endpoint"] == er.COMMUNITY_MIRROR
+    assert len(calls) == 2
+
+
+def test_repair_failover_skipped_for_non_network_failures(model_manager, monkeypatch, tmp_path):
+    """A disk-full/gated-repo repair failure must not trigger endpoint probes."""
+    import huggingface_hub
+    import services.endpoint_race as er
+    from core import prefs
+
+    monkeypatch.setattr(prefs, "_PREFS_PATH", str(tmp_path / "prefs.json"))
+    monkeypatch.setattr(er, "_FAILOVER_ATTEMPTED", set())
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+
+    def boom_probe(endpoint, timeout=None):
+        raise AssertionError("non-network failure must not re-race endpoints")
+
+    monkeypatch.setattr(er, "probe_endpoint", boom_probe)
+    monkeypatch.setattr(
+        huggingface_hub, "snapshot_download",
+        lambda **k: (_ for _ in ()).throw(OSError("No space left on device")),
+    )
+    monkeypatch.setenv("OMNIVOICE_MODEL_REPAIR_BACKOFF_S", "0")
+    monkeypatch.setenv("OMNIVOICE_MODEL_REPAIR_RETRIES", "2")
+    assert model_manager._repair_model_cache("test/checkpoint") is False
 
 
 def test_repair_retries_are_env_tunable(model_manager, monkeypatch):

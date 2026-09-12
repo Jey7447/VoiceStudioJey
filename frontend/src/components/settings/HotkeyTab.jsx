@@ -3,6 +3,7 @@ import { Keyboard } from 'lucide-react';
 import { toast } from 'react-hot-toast';
 import { Trans, useTranslation } from 'react-i18next';
 import { Button } from '../../ui';
+import { useEffectiveDictationShortcut } from '../../hooks/useEffectiveDictationShortcut';
 import { SettingsSection, SettingRow } from './primitives';
 import { isTauri } from './native';
 
@@ -32,30 +33,38 @@ function keyEventToAccelerator(e) {
   return [...mods, key].join('+');
 }
 
+// A pure modifier press means the user is still building the chord — stay
+// quiet. Anything else that fails to produce an accelerator (a bare letter,
+// F5, Space…) is a real rejection and deserves visible feedback.
+function isPureModifierEvent(e) {
+  return /^(Meta|Control|Alt|Shift|OS)/.test(e.key || '');
+}
+
 export default function HotkeyTab() {
   const { t } = useTranslation();
-  const [current, setCurrent] = useState('');
   const [recording, setRecording] = useState(false);
   const [pending, setPending] = useState('');
+  // True after a modifier-less press while recording — drives the inline
+  // "add a modifier" feedback instead of listening forever in silence.
+  const [rejected, setRejected] = useState(false);
   const [saving, setSaving] = useState(false);
   const tauri = isTauri();
+  const { info: shortcut, error: shortcutError } = useEffectiveDictationShortcut(tauri);
+  const current = shortcut.accelerator;
 
-  // Load the saved shortcut on mount.
   useEffect(() => {
-    if (!tauri) return;
-    (async () => {
-      try {
-        const { invoke } = await import('@tauri-apps/api/core');
-        const v = await invoke('get_dictation_shortcut');
-        setCurrent(v || '');
-      } catch (e) {
-        toast.error(t('settings.shortcut_load_failed', { message: e?.message || e }));
-      }
-    })();
-  }, [tauri]);
+    if (!shortcutError) return;
+    toast.error(
+      t('settings.shortcut_load_failed', {
+        message: shortcutError?.message || shortcutError,
+      }),
+    );
+  }, [shortcutError, t]);
 
   // While recording, swallow keystrokes globally and convert the next real
-  // press into an accelerator string. Escape cancels.
+  // press into an accelerator string. Escape cancels; losing window focus
+  // cancels too so a stray click outside doesn't leave a global
+  // key-swallowing listener armed forever.
   useEffect(() => {
     if (!recording) return;
     const onKeyDown = (e) => {
@@ -64,16 +73,28 @@ export default function HotkeyTab() {
       if (e.key === 'Escape') {
         setRecording(false);
         setPending('');
+        setRejected(false);
         return;
       }
       const accel = keyEventToAccelerator(e);
       if (accel) {
         setPending(accel);
         setRecording(false);
+        setRejected(false);
+        return;
       }
+      if (!isPureModifierEvent(e)) setRejected(true);
+    };
+    const onBlur = () => {
+      setRecording(false);
+      setRejected(false);
     };
     window.addEventListener('keydown', onKeyDown, true);
-    return () => window.removeEventListener('keydown', onKeyDown, true);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('blur', onBlur);
+    };
   }, [recording]);
 
   const save = async () => {
@@ -82,9 +103,8 @@ export default function HotkeyTab() {
     try {
       const { invoke } = await import('@tauri-apps/api/core');
       const saved = await invoke('set_dictation_shortcut', { accelerator: pending });
-      setCurrent(saved);
       setPending('');
-      toast.success(t('settings.shortcut_set', { shortcut: saved }));
+      toast.success(t('settings.shortcut_set', { shortcut: saved.display || saved.accelerator }));
     } catch (e) {
       // Common cause: the OS or another app already owns the combo. Surface
       // the raw error so the user can pick something else.
@@ -98,10 +118,9 @@ export default function HotkeyTab() {
     setSaving(true);
     try {
       const { invoke } = await import('@tauri-apps/api/core');
-      const saved = await invoke('set_dictation_shortcut', {
+      await invoke('set_dictation_shortcut', {
         accelerator: 'CmdOrCtrl+Shift+Space',
       });
-      setCurrent(saved);
       setPending('');
       toast.success(t('settings.shortcut_reset'));
     } catch (e) {
@@ -119,11 +138,15 @@ export default function HotkeyTab() {
         </p>
       )}
 
-      <SettingRow title={t('capture.active_shortcut')} control={current || '—'} mono />
+      <SettingRow title={t('capture.active_shortcut')} control={shortcut.display || '—'} mono />
       <SettingRow
         title={recording ? t('capture.press_key') : t('capture.new_shortcut')}
         hint={<Trans i18nKey="capture.desc_detail" components={{ 1: <code />, 2: <code /> }} />}
-        control={recording ? t('capture.listening') : pending || '—'}
+        control={
+          recording
+            ? (rejected && t('capture.needs_modifier')) || t('capture.listening')
+            : pending || '—'
+        }
         mono
       />
 
@@ -132,13 +155,16 @@ export default function HotkeyTab() {
           size="sm"
           variant="subtle"
           onClick={() => {
+            // Toggle: while recording, the same button cancels (Esc still
+            // works too) — re-clicking must not silently re-arm the recorder.
             setPending('');
-            setRecording(true);
+            setRejected(false);
+            setRecording(!recording);
           }}
           disabled={!tauri || saving}
           leading={<Keyboard size={12} />}
         >
-          {recording ? t('capture.recording') : t('capture.record_shortcut')}
+          {recording ? t('common.cancel') : t('capture.record_shortcut')}
         </Button>
         <Button
           size="sm"

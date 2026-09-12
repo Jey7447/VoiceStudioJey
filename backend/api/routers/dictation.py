@@ -23,7 +23,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 
-from api.dependencies import require_loopback
+from api.dependencies import require_local
+from api.public_engine_metadata import public_unavailability
 from core import prefs
 from services import sherpa_dictation as sd
 
@@ -54,7 +55,7 @@ def _read_prefs() -> dict:
     }
 
 
-@router.get("/dictation/models", dependencies=[Depends(require_loopback)])
+@router.get("/dictation/models", dependencies=[Depends(require_local)])
 def list_dictation_models():
     """The seven sherpa-onnx dictation models + install state.
 
@@ -80,12 +81,12 @@ def list_dictation_models():
     return {
         "models": out,
         "engine_available": available,
-        "engine_reason": None if available else reason,
+        "engine_reason": None if available else public_unavailability(reason),
         "default_model_id": sd.DEFAULT_MODEL_ID,
     }
 
 
-@router.get("/dictation/prefs", dependencies=[Depends(require_loopback)])
+@router.get("/dictation/prefs", dependencies=[Depends(require_local)])
 def get_dictation_prefs():
     return _read_prefs()
 
@@ -96,17 +97,17 @@ class DictationPrefsUpdate(BaseModel):
     model_id: Optional[str] = None
 
 
-@router.post("/dictation/prefs", dependencies=[Depends(require_loopback)])
+@router.post("/dictation/prefs", dependencies=[Depends(require_local)])
 def set_dictation_prefs(req: DictationPrefsUpdate):
     """Persist any subset of the dictation prefs. Validates ``mode`` and
     ``model_id`` so a bad value can't wedge the capture engine."""
+    canonical = None
     if req.mode is not None:
         if req.mode not in _VALID_MODES:
             raise HTTPException(
                 status_code=400,
                 detail=f"mode must be one of {_VALID_MODES}",
             )
-        prefs.set_(PREF_MODE, req.mode)
     if req.model_id is not None:
         if not sd.is_sherpa_model(req.model_id):
             raise HTTPException(
@@ -114,14 +115,33 @@ def set_dictation_prefs(req: DictationPrefsUpdate):
                 detail=f"unknown dictation model_id {req.model_id!r}",
             )
         # Normalise to the canonical dictation id (accept repo_id too).
-        prefs.set_(PREF_MODEL_ID, sd.get_spec(req.model_id).id)
-    if req.enabled is not None:
-        prefs.set_(PREF_ENABLED, bool(req.enabled))
-    # Rebuild the cached capture singleton so the change takes effect at once.
+        canonical = sd.get_spec(req.model_id).id
+
+    # Reset before persisting: if the capture service is unavailable, the
+    # request fails without claiming that settings which are not active were
+    # saved. A reset is safe even when a later preference write fails; the old
+    # persisted selection is simply loaded again on next capture.
     try:
         from services import asr_backend
+
         asr_backend._capture_backend = None
         asr_backend._capture_backend_key = None
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Dictation capture backend could not be reset")
+        raise HTTPException(
+            status_code=503,
+            detail="Dictation settings could not be applied. Retry after the capture service is ready.",
+        ) from exc
+
+    if req.mode is not None:
+        prefs.set_(PREF_MODE, req.mode)
+    if canonical is not None:
+        prefs.set_(PREF_MODEL_ID, canonical)
+        # Explicitly choosing a model clears any auto-demotion: the user is in
+        # charge, and a sherpa upgrade may well have fixed the decoder that
+        # produced no text last time. Without this, a demoted model could never
+        # be re-selected from the UI.
+        sd.clear_demotion(canonical)
+    if req.enabled is not None:
+        prefs.set_(PREF_ENABLED, bool(req.enabled))
     return _read_prefs()

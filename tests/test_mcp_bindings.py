@@ -25,7 +25,19 @@ def db(tmp_path, monkeypatch):
     _db.init_db()
     import services.mcp_bindings as mb
     importlib.reload(mb)
-    return mb
+    try:
+        yield mb
+    finally:
+        # Mirror the `client` fixture below: importlib.reload mutates the
+        # module objects IN PLACE, so without this teardown every later test
+        # in a combined run — even one holding a collection-time reference —
+        # keeps reading DB/voices paths bound to this test's dead tmp_path
+        # (it broke backend/tests personas/audiobook in full-suite runs).
+        # Restore the env first, then re-reload under the restored value.
+        monkeypatch.undo()
+        importlib.reload(_cfg)
+        importlib.reload(_db)
+        importlib.reload(mb)
 
 
 def test_upsert_creates_then_updates(db):
@@ -169,9 +181,19 @@ def client(tmp_path, monkeypatch):
         # Reloading main above poisons the global module for any later test
         # that does `from main import …`. Reload once more with the default
         # (project) data dir restored so the shared module is clean again.
+        # The api.*/services.* trees must be PURGED first, not merely left
+        # cached: `import main` above (re)imported them under this test's
+        # tmp_path env, and modules like api.routers.profiles keep
+        # value-copies of core.config paths (`from core.config import
+        # VOICES_DIR`) that an in-place reload of core.config alone cannot
+        # heal — later personas/profiles requests then wrote voice files
+        # into this test's dead tmp_path in combined full-suite runs.
         monkeypatch.undo()
         importlib.reload(importlib.import_module("core.config"))
         importlib.reload(importlib.import_module("core.db"))
+        for m in list(sys.modules):
+            if m in ("api", "services") or m.startswith(("api.", "services.")):
+                sys.modules.pop(m, None)
         importlib.reload(_main)
 
 
@@ -182,6 +204,20 @@ def test_rest_crud_roundtrip(client):
     assert len(client.get("/api/mcp/bindings").json()) == 1
     assert client.delete("/api/mcp/bindings/claude-code").status_code == 200
     assert client.delete("/api/mcp/bindings/claude-code").status_code == 404
+
+
+def test_server_mode_binding_mutations_require_api_key(client, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("OMNIVOICE_SERVER_MODE", "1")
+    monkeypatch.delenv("OMNIVOICE_API_KEY", raising=False)
+    remote = TestClient(client.app, client=("172.17.0.1", 50000))
+
+    assert remote.get("/api/mcp/bindings").status_code == 200
+    assert remote.put(
+        "/api/mcp/bindings", json={"client_id": "attacker"}
+    ).status_code == 403
+    assert remote.delete("/api/mcp/bindings/attacker").status_code == 403
 
 
 def test_rest_rejects_empty_client_id(client):

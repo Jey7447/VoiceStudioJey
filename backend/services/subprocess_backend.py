@@ -1,8 +1,8 @@
 """SubprocessBackend — long-lived sidecar-process TTS primitive (Phase 2.1).
 
 The architectural keystone for engine isolation. Engines that need their
-own Python venv (because their dependency pins conflict with OmniVoice's
-— IndexTTS demands `transformers<5`, OmniVoice demands `transformers>=5.3`)
+own Python venv (because their dependency pins conflict with VoiceStudio's
+— IndexTTS demands `transformers<5`, VoiceStudio demands `transformers>=5.3`)
 run inside a `subprocess.Popen` child interpreter. The parent backend
 talks to them through length-prefixed JSON over the child's stdin/stdout.
 
@@ -32,14 +32,15 @@ Threat-model summary (see Plan 02-01 frontmatter):
               AUTH-05 installed (``HFTokenRedactor``) on the root logger.
     T-02-04 — compromised sidecar emitting unexpected ops: parent allowlist
               ``PARENT_INBOUND_OPS`` rejects everything else.
-    T-02-05 — Tauri group-kill scope: ``start_new_session=True`` on Unix
-              and ``CREATE_NEW_PROCESS_GROUP`` on Windows isolate the
-              sidecar's process group.
+    T-02-05 — nested containment: a retained POSIX supervisor process group or
+              Windows Job owns each engine operation, while still permitting
+              independent timeout teardown and cleanup on backend death.
 """
 from __future__ import annotations
 
 import atexit
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -55,9 +56,21 @@ from typing import Optional
 import numpy as np
 import torch
 
+from core.contained_subprocess import spawn_owned
 from services.tts_backend import TTSBackend
 
 logger = logging.getLogger("omnivoice.subprocess_backend")
+
+
+def _os_exec_refusal(exc: OSError) -> str:
+    """User-facing cause for a spawn-time OSError, built from errno/strerror
+    only — ``str(exc)`` commonly embeds ``exc.filename`` (the interpreter's
+    absolute path, i.e. the user's home directory), and this string flows
+    into a 503 detail and the UI log viewer / pasted bug reports."""
+    cause = exc.strerror or "execution failed"
+    if exc.errno is not None:
+        cause = f"[Errno {exc.errno}] {cause}"
+    return cause
 
 
 # ── Wire protocol constants ────────────────────────────────────────────────
@@ -95,7 +108,7 @@ RECV_TIMEOUT_S = 60.0
 #
 # A subprocess engine's sidecar holds a process and, for GPU engines, VRAM —
 # for the whole life of the backend, even when the user has moved on to another
-# engine. The default in-process OmniVoice model already idle-unloads via
+# engine. The default in-process VoiceStudio model already idle-unloads via
 # model_manager.idle_worker; this gives the *subprocess* engine class the same
 # treatment: a background reaper shuts down sidecars that have been idle past a
 # timeout, and the next request transparently respawns one (the base already
@@ -252,6 +265,91 @@ def _ensure_reaper_running() -> None:
 # ── Base class ─────────────────────────────────────────────────────────────
 
 
+#: How often to prove liveness while an engine's venv is being resolved.
+#: Matches the sidecar's own cold-load cadence (#1367) so the guarded waiter
+#: sees the same rhythm from both steps.
+_RESOLVE_HEARTBEAT_S = 5.0
+
+
+@contextlib.contextmanager
+def _heartbeat_while_resolving(engine_id: str):
+    """Report progress while a slow engine-venv resolution runs (#1414).
+
+    A probe that spawns interpreters, or a bootstrap that installs torch, can
+    outlast the generate budget on its own. Both are demonstrably *working*
+    the whole time, so the deadline should extend rather than expire — which
+    is what the execution clock's load heartbeat is for.
+
+    Two details that are easy to get wrong:
+
+    * **Pool jobs only.** An off-pool caller never runs on a thread the clock
+      tracks, and heartbeating from one would credit an ident a pool worker
+      might later reuse — up to a grace period of unearned extension, which
+      is the #1379 lesson.
+    * **The resolving thread's ident, not the beater's.** The heartbeat runs
+      on a helper thread so it can tick while resolution blocks, but the job
+      the clock is watching is the caller's. Capturing the ident up front is
+      what makes the extension land on the right job.
+
+    Never raises: a failed heartbeat must not fail a generation.
+    """
+    try:
+        from services.model_manager import running_on_gpu_pool
+
+        on_pool = running_on_gpu_pool()
+    except Exception:  # noqa: BLE001 — best-effort by construction
+        on_pool = False
+    if not on_pool:
+        yield
+        return
+
+    ident = threading.get_ident()
+    stop = threading.Event()
+
+    def _beat():
+        try:
+            from services.model_manager import (
+                MODEL_LOAD_HEARTBEAT_GRACE_S, _MODEL_LOAD_ACTIVITY,
+            )
+        except Exception:  # noqa: BLE001
+            return
+        while not stop.wait(_RESOLVE_HEARTBEAT_S):
+            try:
+                _MODEL_LOAD_ACTIVITY[ident] = (
+                    time.monotonic(), MODEL_LOAD_HEARTBEAT_GRACE_S,
+                )
+            except Exception:  # noqa: BLE001
+                return
+
+    t = threading.Thread(
+        target=_beat, name=f"{engine_id}-resolve-heartbeat", daemon=True,
+    )
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        # Join, don't just signal. `_beat()` can be past its `stop.wait()` and
+        # already committed to a write at the moment the flag is set, so
+        # signalling alone lets that write land at an arbitrary later point.
+        #
+        # That matters because of what runs next: `_run_on_gpu_pool`'s `_job`
+        # pops this ident from `_MODEL_LOAD_ACTIVITY` in its `finally`
+        # (model_manager.py) precisely so a stale beat cannot vouch for a
+        # future job — GPU-pool idents are reused. A write arriving after that
+        # pop resurrects the entry, and the next job scheduled onto this
+        # worker inherits a heartbeat it never emitted: the wedge detector
+        # reads it as live progress and keeps extending a job that is stuck.
+        #
+        # Joining orders the last write BEFORE the pop, so the pop clears it.
+        # This must not be bounded: returning while the helper is still alive
+        # would recreate the late-write race this join closes.  The helper's
+        # only work after ``wait`` is an in-memory mapping assignment guarded
+        # by its own broad exception handler, so there is no blocking external
+        # operation to time out here.
+        t.join()
+
+
 class SubprocessBackend(TTSBackend):
     """Long-lived sidecar-process TTS backend. Subclasses provide
     ``venv_python()`` and ``sidecar_script()``; the base class owns
@@ -265,9 +363,23 @@ class SubprocessBackend(TTSBackend):
     # be a different class object from the one the subclass closed over.
     # A duck-typed marker survives that.
     _is_subprocess_isolated: bool = True
+    spawn_ready_timeout_s: float = SPAWN_READY_TIMEOUT_S
+
+    # Generation happens in the sidecar: parent-side accelerator counters
+    # can't see its allocations (see TTSBackend.runs_out_of_process).
+    runs_out_of_process: bool = True
 
     # Default sample rate; subclasses override.
     _DEFAULT_SAMPLE_RATE = 24000
+
+    # Per-engine recv timeout for generate(): how long the parent waits for the
+    # sidecar's audio frame before the watchdog hard-kills the child and reclaims
+    # its VRAM/device. Default is the conservative RECV_TIMEOUT_S (60s). A
+    # subclass whose legitimate generates run longer overrides it (or exposes it
+    # as a property) so a slow-but-valid synth is not falsely killed, while a
+    # genuinely wedged one is still reclaimed. health_check() keeps using
+    # RECV_TIMEOUT_S directly, since a ping must stay fast.
+    recv_timeout_s: float = RECV_TIMEOUT_S
 
     # ── instance state (initialised in __init__) ───────────────────────────
 
@@ -294,6 +406,14 @@ class SubprocessBackend(TTSBackend):
     def _touch(self) -> None:
         """Mark the sidecar as just-used so the idle reaper leaves it alone."""
         self._last_used = time.monotonic()
+
+    def _validate_generate_authorization(self) -> None:
+        """Revalidate subclass-specific authorization after queueing.
+
+        Called while ``_lock`` is held and immediately before sidecar access so
+        a request that waited behind another synthesis cannot outlive a revoked
+        capability. Most subprocess engines have no extra authorization.
+        """
 
     def idle_seconds(self) -> float:
         """Seconds since the last sidecar activity (spawn or frame I/O)."""
@@ -352,20 +472,45 @@ class SubprocessBackend(TTSBackend):
             "env": env,
             "bufsize": 0,  # unbuffered binary pipes
         }
-        # Process-group isolation so the Tauri lib.rs group-kill in shutdown
-        # doesn't escape into other children. See T-02-05.
-        if sys.platform == "win32":
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            kwargs["start_new_session"] = True
-
-        python_path = str(self.venv_python())
+        # `venv_python()` resolves the engine's interpreter, and on a cold
+        # first run that is not cheap: it spawns each candidate to import the
+        # engine (bounded, but tens of seconds on a slow disk), and if none is
+        # installed it can run the whole `uv venv` + `uv pip install`
+        # bootstrap — minutes, by design.
+        #
+        # All of that happens on a GPU-pool worker, inside a generate request
+        # whose execution budget is 300s by default. Nothing along the way
+        # reported progress, so the budget expired mid-install and the job was
+        # abandoned and blamed on the machine's compute (#1414). The sidecar's
+        # own cold load already heartbeats for exactly this reason (#1367);
+        # resolution is the step before it that never did.
+        with _heartbeat_while_resolving(self.id):
+            python_path = str(self.venv_python())
         script_path = str(self.sidecar_script())
+        # #1172 class: validate the interpreter before exec so a broken /
+        # half-installed engine venv (0-byte or truncated python, dangling
+        # symlink) surfaces as a typed, actionable error instead of an
+        # OSError "[Errno 8] Exec format error" at spawn time.
+        from services.binary_preflight import InvalidBinaryError, validate_executable
+        _venv_hint = (
+            f"the '{self.id}' engine's private environment is broken — "
+            f"reinstall the engine from Model Catalogue → Engines"
+        )
+        validate_executable(python_path, hint=_venv_hint)
+        # Basenames only — absolute paths embed the user's home directory,
+        # and these lines flow into the UI log viewer / pasted bug reports.
         logger.info(
             "[%s] spawning sidecar: %s %s",
-            self.id, python_path, script_path,
+            self.id, Path(python_path).name, Path(script_path).name,
         )
-        self._proc = subprocess.Popen([python_path, script_path], **kwargs)
+        try:
+            self._proc = spawn_owned([python_path, script_path], **kwargs)
+        except OSError as exc:
+            raise InvalidBinaryError(
+                python_path,
+                f"the OS refused to execute it ({_os_exec_refusal(exc)})",
+                _venv_hint,
+            ) from exc
 
         # Drain stderr in a background thread so the sidecar can't block on
         # a full pipe. Lines flow into the root logger; AUTH-05's
@@ -380,7 +525,7 @@ class SubprocessBackend(TTSBackend):
         # Block on the ready handshake. A sidecar that fails to emit ready
         # within SPAWN_READY_TIMEOUT_S is killed and the failure is raised.
         try:
-            frame = self._recv_with_timeout(SPAWN_READY_TIMEOUT_S)
+            frame = self._recv_with_timeout(self.spawn_ready_timeout_s)
         except Exception:
             self._force_kill()
             raise
@@ -488,23 +633,41 @@ class SubprocessBackend(TTSBackend):
         sample rate. Decodes the int16 PCM the sidecar returns into float32
         in [-1, 1].
         """
-        # Lazy-import the GPU pool so importing this module doesn't pull in
-        # the entire model_manager + torch ecosystem at registry-listing time.
-        from services.model_manager import _get_gpu_pool
+        # On-pool callers (every HTTP/dub/batch generate, dispatched via
+        # run_on_gpu_pool_guarded) already own a pool slot; re-acquiring would
+        # self-deadlock on a 1-worker (MPS) pool, so skip it. Off-pool callers
+        # (the deep-synth diagnostic probe in diagnose.py; the Settings
+        # self-test rejects subprocess-isolated engines with a 400) hold a real
+        # slot for the whole synthesis via _occupy so they serialize against
+        # pool jobs instead of over-subscribing the GPU.
+        from services.model_manager import running_on_gpu_pool
+        _held = None
+        # Bound before the branch: only the off-pool path assigns a real
+        # future, and `_held is not None` already implies that — but CodeQL
+        # (py/uninitialized-local-variable) reads the two as independent, and
+        # so would anyone adding a third exit path later.
+        slot_future = None
+        if not running_on_gpu_pool():
+            # Lazy-import the GPU pool so importing this module doesn't pull in
+            # the entire model_manager + torch ecosystem at registry-listing time.
+            from services.model_manager import _get_gpu_pool
+            pool = _get_gpu_pool()
+            _held = threading.Event()
+            _acquired = threading.Event()
 
-        # Acquire a GPU pool worker for the duration of this generate. The
-        # try/finally guarantees the slot is released even if the sidecar
-        # dies mid-frame (T-02-02 / Pitfall 7).
-        pool = _get_gpu_pool()
-        slot_future = pool.submit(lambda: None)
-        try:
-            slot_future.result(timeout=10)  # wait for our turn
-        except Exception:
-            slot_future.cancel()
-            raise
+            def _occupy():
+                _acquired.set()
+                _held.wait()
+
+            slot_future = pool.submit(_occupy)
 
         try:
+            if _held is not None and not _acquired.wait(timeout=10):
+                if slot_future is not None:
+                    slot_future.cancel()
+                raise TimeoutError("timed out waiting for a free GPU worker")
             with self._lock:
+                self._validate_generate_authorization()
                 self._spawn()
                 msg = {"op": "synthesize", "text": text}
                 # Filter kwargs to JSON-safe primitives. Tensor / Path / etc.
@@ -514,7 +677,31 @@ class SubprocessBackend(TTSBackend):
                     if _is_jsonable(v):
                         msg[k] = v
                 self._send(msg)
-                reply = self._recv_with_timeout(RECV_TIMEOUT_S)
+                reply = self._recv_with_timeout(self.recv_timeout_s)
+                # A cold sidecar may emit non-terminal {"op": "progress"} frames
+                # (during a model load, etc.) before the terminal audio frame.
+                # Each recv re-arms the watchdog, so a long-but-active load
+                # survives while a silent wedge is still killed at the deadline.
+                #
+                # Each frame is also reported to the GPU pool's execution clock
+                # (#1367): the sidecar heartbeats every ~5s precisely to prove a
+                # cold download is healthy, and without this the outer 300s
+                # generate budget expired mid-download and blamed the hardware.
+                while reply is not None and reply.get("op") == "progress":
+                    try:
+                        from services.model_manager import (
+                            report_model_load_activity, running_on_gpu_pool,
+                        )
+                        # Pool jobs only: an off-pool caller (the diagnostic
+                        # probe) never runs _job(), so its thread ident would
+                        # never be cleared — and a pool worker later reusing
+                        # that ident would inherit up to a grace period of
+                        # unearned extension (CodeRabbit on #1379).
+                        if running_on_gpu_pool():
+                            report_model_load_activity()
+                    except Exception:
+                        pass  # the heartbeat is best-effort; never fail a synth over it
+                    reply = self._recv_with_timeout(self.recv_timeout_s)
             if not reply:
                 raise RuntimeError(f"{self.id} sidecar closed pipe mid-generate")
             if reply.get("op") == "error":
@@ -531,12 +718,11 @@ class SubprocessBackend(TTSBackend):
             tensor = torch.from_numpy(arr.copy()).unsqueeze(0)
             return tensor
         finally:
-            # Slot is released the instant this thread leaves the pool's
-            # task — by holding slot_future we kept one worker busy; nothing
-            # further to do. (ThreadPoolExecutor doesn't expose a manual
-            # release; the slot returns to the pool when our submitted no-op
-            # finishes, which happens immediately after .result() above.)
-            pass
+            # Release the held GPU-pool worker (off-pool path only). _occupy
+            # blocks the worker until this fires, so the slot is held for the
+            # whole synthesis even though this thread isn't the pool worker.
+            if _held is not None:
+                _held.set()
 
     # ── wire protocol ──────────────────────────────────────────────────────
 

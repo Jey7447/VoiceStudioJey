@@ -1,140 +1,219 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { ArrowLeft, ExternalLink, MessageCircle, Mail, Bug, Globe } from 'lucide-react';
+import {
+  ArrowRight,
+  ExternalLink,
+  MessageCircle,
+  Bug,
+  Lightbulb,
+  Heart,
+  ShieldAlert,
+  Mail,
+  Globe,
+  Megaphone,
+} from 'lucide-react';
 import { Button } from '../ui';
+import { Card } from '@/components/ui/card';
+import { buttonVariants } from '@/components/ui/button.tsx';
+import { cn } from '@/lib/utils';
 import { openExternal } from '../api/external';
+import ReportBugButton from '../components/ReportBugButton';
 
-// All outward contact channels in one place (#contact). Values are the same
-// ones used across the app (donate/license footers) so there's a single source.
+// One home for every outward channel. The repo/Discord/security URLs match the
+// values the rest of the app uses (bug reporter, footer, SECURITY.md) so a link
+// change here can never leave one surface pointing somewhere stale (#contact).
+const REPO_URL = 'https://github.com/debpalash/VoiceStudio';
+const ISSUES_URL = `${REPO_URL}/issues`;
 const DISCORD_URL = 'https://discord.gg/bzQavDfVV9';
-const EMAIL = 'OmniVoice@palash.dev';
-const ISSUES_URL = 'https://github.com/debpalash/OmniVoice-Studio/issues';
+// GitHub Security Advisories = the private "report a vulnerability" flow that
+// SECURITY.md points at (never a public issue for security bugs).
+const SECURITY_URL = `${REPO_URL}/security/advisories/new`;
+const EMAIL = 'VoiceStudio@palash.dev';
 const WEBSITE_URL = 'https://palash.dev';
+const X_URL = 'https://x.com/idebpalash';
 
-const CHANNELS = [
+// Compact action cards for every outward channel. `kind` picks CTA behaviour:
+//   bug      → reuse ReportBugButton (prefilled GitHub issue + scrubbed diag)
+//   external → open a URL in the browser (via openExternal / real <a rel>)
+//   internal → route to another in-app page (Support), no duplication here
+const SECTIONS = [
   {
-    id: 'discord',
+    id: 'bug',
+    icon: Bug,
+    hue: '#fb4934',
+    kind: 'bug',
+    titleKey: 'contact.bug_title',
+    titleDefault: 'Report a bug',
+    ctaKey: 'contact.bug_cta',
+    ctaDefault: 'Open bug reporter',
+  },
+  {
+    id: 'feature',
+    icon: Lightbulb,
+    hue: '#8ec07c',
+    kind: 'external',
+    url: ISSUES_URL,
+    titleKey: 'contact.feature_title',
+    titleDefault: 'Request a feature or ask',
+    ctaKey: 'contact.feature_cta',
+    ctaDefault: 'Open GitHub Issues',
+  },
+  {
+    id: 'community',
     icon: MessageCircle,
     hue: '#5865F2',
-    labelKey: 'contact.discord',
-    labelDefault: 'Discord',
-    descKey: 'contact.discord_desc',
-    descDefault: 'Chat with the community and get help fast.',
-    value: 'discord.gg/bzQavDfVV9',
+    kind: 'external',
     url: DISCORD_URL,
+    titleKey: 'contact.community_title',
+    titleDefault: 'Get help & community',
+    ctaKey: 'contact.community_cta',
+    ctaDefault: 'Join the Discord',
   },
   {
-    id: 'email',
-    icon: Mail,
-    hue: '#d3869b',
-    labelKey: 'contact.email',
-    labelDefault: 'Email',
-    descKey: 'contact.email_desc',
-    descDefault: 'Licensing, partnerships, or anything private.',
-    value: EMAIL,
-    url: `mailto:${EMAIL}`,
+    id: 'follow',
+    icon: Megaphone,
+    hue: '#1d9bf0',
+    kind: 'external',
+    url: X_URL,
+    titleKey: 'contact.follow_title',
+    titleDefault: 'Follow along on X',
+    ctaKey: 'contact.follow_cta',
+    ctaDefault: 'Follow on X',
   },
   {
-    id: 'issues',
-    icon: Bug,
-    hue: '#8ec07c',
-    labelKey: 'contact.issues',
-    labelDefault: 'GitHub Issues',
-    descKey: 'contact.issues_desc',
-    descDefault: 'Report a bug or request a feature.',
-    value: 'github.com/debpalash/OmniVoice-Studio',
-    url: ISSUES_URL,
+    id: 'support',
+    icon: Heart,
+    hue: 'var(--color-brand)',
+    kind: 'internal',
+    titleKey: 'contact.support_title',
+    titleDefault: 'Support the project',
+    ctaKey: 'contact.support_cta',
+    ctaDefault: 'See ways to support',
   },
   {
-    id: 'website',
-    icon: Globe,
-    hue: '#83a598',
-    labelKey: 'contact.website',
-    labelDefault: 'Website',
-    descKey: 'contact.website_desc',
-    descDefault: 'More about the project and the maker.',
-    value: 'palash.dev',
-    url: WEBSITE_URL,
+    id: 'security',
+    icon: ShieldAlert,
+    hue: '#fabd2f',
+    kind: 'external',
+    url: SECURITY_URL,
+    titleKey: 'contact.security_title',
+    titleDefault: 'Report a security issue',
+    ctaKey: 'contact.security_cta',
+    ctaDefault: 'Report privately',
   },
 ];
 
 /**
- * ContactPage — a standalone "reach me" page: Discord, email, GitHub issues,
- * and website as clean, single-tap rows. Reached via `mode === 'contact'`.
+ * ExternalCta — a subtle-button-styled link that opens in the system browser.
+ * Rendered as a real `<a rel="noreferrer">` (keyboard-focusable, right-click
+ * "copy link", screen-reader "link"), but the actual open is routed through
+ * `openExternal` so it works inside the Tauri webview too (window.open is
+ * blocked there). `preventDefault` keeps the anchor from double-navigating.
  */
-export default function ContactPage({ onBack }) {
-  const { t } = useTranslation();
-
+function ExternalCta({
+  href,
+  label,
+  ariaLabel,
+  leading = null,
+  trailing = <ExternalLink size={13} />,
+}) {
   return (
-    <div className="relative isolate flex flex-1 flex-col overflow-y-auto bg-[var(--chrome-bg)]">
-      <div className="lp-aurora" aria-hidden="true">
-        <span className="lp-aurora__blob lp-aurora__blob--pink" />
-        <span className="lp-aurora__blob lp-aurora__blob--green" />
-        <span className="lp-aurora__blob lp-aurora__blob--amber" />
-      </div>
-
-      <div className="relative z-[2] flex items-center justify-between gap-3 px-11 pt-4">
-        <Button variant="subtle" size="sm" onClick={onBack} leading={<ArrowLeft size={14} />}>
-          {t('donate.back')}
-        </Button>
-        <span className="w-24 shrink-0" aria-hidden="true" />
-      </div>
-
-      <div className="relative z-[1] mx-auto flex w-full max-w-[640px] flex-1 flex-col justify-center gap-6 px-8 pb-10">
-        <div className="flex flex-col gap-6">
-          <div className="text-center">
-            <span className="mx-auto mb-4 flex size-12 items-center justify-center rounded-md border border-transparent bg-[color-mix(in_srgb,#d3869b_12%,transparent)]">
-              <MessageCircle
-                size={24}
-                className="text-[#f3a5b6] drop-shadow-[0_0_12px_rgba(243,165,182,0.5)]"
-              />
-            </span>
-            <h2 className="relative inline-block font-serif text-[2rem] font-normal leading-tight tracking-[-0.02em] text-[var(--chrome-fg)]">
-              {t('contact.hero_title', { defaultValue: 'Get in touch' })}
-              <span className="lp-hero__sweep" aria-hidden="true" />
-            </h2>
-            <p className="mx-auto mt-2.5 max-w-[480px] font-sans text-[0.8rem] leading-[1.65] text-[var(--chrome-fg-muted)]">
-              {t('contact.hero_desc', {
-                defaultValue:
-                  'Questions, bugs, licensing, or just to say hi — here’s how to reach me.',
-              })}
-            </p>
-          </div>
-
-          <section className="grid grid-cols-1 gap-2.5">
-            {CHANNELS.map((c) => {
-              const Icon = c.icon;
-              return (
-                <button
-                  key={c.id}
-                  type="button"
-                  onClick={() => openExternal(c.url)}
-                  style={{ '--card-hue': c.hue }}
-                  className="flex w-full items-center gap-3 overflow-hidden rounded-md border border-border bg-transparent px-3.5 py-2.5 text-left transition-colors hover:border-transparent hover:bg-[color-mix(in_srgb,var(--card-hue)_6%,transparent)]"
-                >
-                  <span className="flex size-8 shrink-0 items-center justify-center rounded-md border border-transparent bg-[color-mix(in_srgb,var(--card-hue)_10%,transparent)]">
-                    <Icon size={20} />
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block font-mono text-xs font-semibold uppercase tracking-[var(--chrome-label-track)] text-[var(--chrome-fg)]">
-                      {t(c.labelKey, { defaultValue: c.labelDefault })}
-                    </span>
-                    <span className="block font-sans text-[0.68rem] leading-snug text-[var(--chrome-fg-muted)]">
-                      {t(c.descKey, { defaultValue: c.descDefault })}
-                    </span>
-                    <span className="mt-1 block break-all font-mono text-[11px] text-[var(--chrome-fg-muted)] opacity-85">
-                      {c.value}
-                    </span>
-                  </span>
-                  <span className="flex size-7 shrink-0 items-center justify-center rounded-md border border-border text-[var(--chrome-fg-muted)]">
-                    <ExternalLink size={14} />
-                  </span>
-                </button>
-              );
-            })}
-          </section>
-        </div>
-      </div>
-    </div>
+    <a
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      aria-label={ariaLabel || label}
+      onClick={(e) => {
+        e.preventDefault();
+        openExternal(href);
+      }}
+      className={cn(buttonVariants({ variant: 'subtle', size: 'omniSm' }), 'gap-1.5')}
+    >
+      {leading}
+      <span>{label}</span>
+      {trailing}
+    </a>
   );
 }
+
+// Small mono caption with a trailing hairline — matches the Support page's
+// SectionTitle so the two pages read as one family.
+/**
+ * The contact channels, as a SECTION rather than a page.
+ *
+ * Sponsor, commercial licensing and contact were three separate destinations
+ * for one question — "how do I reach these people / support this" — so they
+ * now live together on SupportPage. This exports the body; the page shell
+ * (back button, aurora, scroll container) belongs to the host.
+ */
+export function ContactSections({ onSupport }) {
+  const { t } = useTranslation();
+
+  const goSupport = () => {
+    if (onSupport) onSupport();
+    else document.getElementById('support-give')?.scrollIntoView({ block: 'start' });
+  };
+
+  const renderCta = (s) => {
+    const label = t(s.ctaKey, { defaultValue: s.ctaDefault });
+    if (s.kind === 'bug') return <ReportBugButton label={label} />;
+    if (s.kind === 'internal') {
+      return (
+        <Button variant="subtle" size="sm" trailing={<ArrowRight size={13} />} onClick={goSupport}>
+          {label}
+        </Button>
+      );
+    }
+    return <ExternalCta href={s.url} label={label} />;
+  };
+
+  return (
+    <>
+      <section
+        className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-2.5"
+        aria-label={t('contact.channels_label', { defaultValue: 'Ways to get in touch' })}
+      >
+        {SECTIONS.map((s) => {
+          const Icon = s.icon;
+          return (
+            <Card
+              key={s.id}
+              style={{ '--card-hue': s.hue }}
+              className="h-full flex-row flex-wrap items-center gap-2.5 rounded-md border-border bg-transparent p-3 shadow-none transition-colors hover:border-border-strong hover:bg-[var(--chrome-hover-bg)]"
+            >
+              <span className="flex size-9 shrink-0 items-center justify-center rounded-md border border-transparent bg-[color-mix(in_srgb,var(--card-hue)_12%,transparent)] text-[var(--card-hue)]">
+                <Icon size={17} />
+              </span>
+              <h3 className="min-w-[120px] flex-1 font-serif text-[1rem] font-medium leading-snug text-[var(--chrome-fg)]">
+                {t(s.titleKey, { defaultValue: s.titleDefault })}
+              </h3>
+              <div className="shrink-0">{renderCta(s)}</div>
+            </Card>
+          );
+        })}
+      </section>
+
+      <div className="flex flex-wrap items-center justify-center gap-2">
+        <ExternalCta
+          href={`mailto:${EMAIL}`}
+          label={t('contact.email', { defaultValue: 'Email' })}
+          ariaLabel={t('contact.email_desc', {
+            defaultValue: 'Email — licensing, partnerships, or anything private',
+          })}
+          leading={<Mail size={13} />}
+          trailing={null}
+        />
+        <ExternalCta
+          href={WEBSITE_URL}
+          label={t('contact.website', { defaultValue: 'Website' })}
+          ariaLabel={t('contact.website_desc', {
+            defaultValue: 'Website — more about the project and the maker',
+          })}
+          leading={<Globe size={13} />}
+        />
+      </div>
+    </>
+  );
+}
+
+export default ContactSections;

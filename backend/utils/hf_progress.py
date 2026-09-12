@@ -32,6 +32,9 @@ logger = logging.getLogger("omnivoice.hf_progress")
 current_repo_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "omnivoice_hf_progress_repo_id", default=None,
 )
+current_target: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "omnivoice_hf_progress_target", default="local",
+)
 
 # Event shape forwarded to listeners. Typed loosely on purpose — SSE encodes
 # it as JSON so consumers read the dict directly.
@@ -99,6 +102,8 @@ def _emit(event: ProgressEvent) -> None:
     rid = current_repo_id.get()
     if rid is not None and "repo_id" not in event:
         event = {**event, "repo_id": rid}
+    if "target" not in event:
+        event = {**event, "target": current_target.get()}
     with _listener_lock:
         listeners = list(_listeners.values())
     for cb in listeners:
@@ -121,7 +126,11 @@ class SafeFileWrapper:
     def write(self, s):
         try:
             self.fp.write(s)
-        except OSError:
+        except (OSError, UnicodeError):
+            # OSError: EPIPE from a dead parent shell (the wrapper's original
+            # job). UnicodeError (#1155): a library print of user text hitting
+            # a non-UTF-8 stream — cp1252 stdout on Windows — must not abort
+            # the operation that printed. Logs are best-effort; work is not.
             pass
     def flush(self):
         try:

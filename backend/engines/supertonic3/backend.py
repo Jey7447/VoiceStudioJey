@@ -70,6 +70,7 @@ class Supertonic3Backend(SubprocessBackend):
     id = "supertonic3"
     display_name = "Supertonic-3 (31 langs, CPU ONNX, 7 preset voices, OpenRAIL-M)"
     supports_voice_design = False  # preset voices only
+    supports_cloning = False  # preset voices only; generate() never reads ref_audio
     # TTS-04: honest hardware reporting. Supertonic-3 has no CUDA / MPS
     # path in the SDK ‑‑ ONNX Runtime CPU EP only.
     gpu_compat: tuple[str, ...] = ("cpu",)
@@ -99,8 +100,8 @@ class Supertonic3Backend(SubprocessBackend):
             import supertonic  # type: ignore[import-not-found]  # noqa: F401
         except ImportError:
             return False, (
-                "supertonic package not installed. Enable in Settings → "
-                "Engines (installs `supertonic` via `uv add --optional "
+                "supertonic package not installed. Enable in "
+                "Model Catalogue → Engines (installs `supertonic` via `uv add --optional "
                 "supertonic supertonic==1.3.1`)."
             )
 
@@ -119,7 +120,7 @@ class Supertonic3Backend(SubprocessBackend):
             accepted = False
         if not accepted:
             return False, (
-                "Supertonic-3 license not accepted. Open Settings → Engines → "
+                "Supertonic-3 license not accepted. Open Model Catalogue → Engines → "
                 "Supertonic-3 and click Accept to enable. "
                 "(MIT code license + OpenRAIL-M model license.)"
             )

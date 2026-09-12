@@ -10,15 +10,20 @@ import {
   Scissors,
   Merge,
   MoreHorizontal,
+  Minus,
+  Plus,
   Sparkles,
+  Volume2,
 } from 'lucide-react';
 import { formatTime } from '../utils/format';
 import { LANG_CODES } from '../utils/languages';
-import { PRESETS } from '../utils/constants';
+import { MIN_SEG_DUR } from '../utils/timeline';
 import { Menu, Button, Badge } from '../ui';
+import VoiceSelector from './VoiceSelector';
 
 const CHAR_BUDGET_RATIO = 1.3;
 const SENTENCE_END = /[.!?。！？]/;
+const TIME_EPSILON = 1e-9;
 
 function rowClass(isActive, isDone, selected, isPlaying, timelineSelected) {
   return `segment-row${isActive ? ' segment-active' : ''}${isDone ? ' segment-done' : ''}${selected ? ' segment-selected' : ''}${isPlaying ? ' segment-playing' : ''}${timelineSelected ? ' segment-timeline-selected' : ''}`;
@@ -53,7 +58,8 @@ function bestSplitPoint(text) {
 function parseTime(s) {
   const m = /^\s*(\d+):([0-5]?\d(?:\.\d+)?)\s*$/.exec(s);
   if (m) return parseInt(m[1], 10) * 60 + parseFloat(m[2]);
-  const n = parseFloat(s);
+  if (String(s).includes(':') || !/^\s*\d+(?:\.\d+)?\s*$/.test(s)) return null;
+  const n = Number(s);
   return Number.isFinite(n) ? n : null;
 }
 
@@ -76,10 +82,18 @@ function DubSegmentRow({
   onSelect,
   onSplit,
   onMerge,
+  onInsert,
+  onMoveResize,
   canMerge,
+  canMergePrev,
   onDirect,
   onSeek,
   timelineSelected,
+  hasOverlap,
+  liveEnabled,
+  liveActive,
+  onLiveEdit,
+  onLiveToggle,
 }) {
   const { t } = useTranslation();
   const textInputRef = useRef(null);
@@ -127,6 +141,16 @@ function DubSegmentRow({
         label: t('segment.fit_stretched', { ratio: r.toFixed(2) }),
         title: t('segment.fit_stretched_title', { ratio: r.toFixed(2) }),
       };
+    } else if (fitStatus.status === 'audio_slowed') {
+      // Underrun fill: the line ran shorter than its slot and was slowed
+      // (pitch-preserved) toward it so speech covers the on-screen mouth time.
+      const r = fitStatus.audio_rate || 1.0;
+      fitBadge = {
+        color: '#83a598',
+        Icon: Circle,
+        label: t('segment.fit_slowed', { ratio: r.toFixed(2) }),
+        title: t('segment.fit_slowed_title', { ratio: r.toFixed(2) }),
+      };
     }
   } else if (seg.sync_ratio !== undefined) {
     const r = seg.sync_ratio;
@@ -157,6 +181,56 @@ function DubSegmentRow({
   const overBudget =
     seg.text_original && seg.text.length > Math.ceil(seg.text_original.length * CHAR_BUDGET_RATIO);
 
+  // Both time fields commit through the SAME path the timeline drag handles
+  // use (segmentMoveResize → commitMoveResize), so typing a time and dragging
+  // its edge produce identical results — including the speed recompute that
+  // keeps the dubbed audio inside a resized slot. The numeric start field used
+  // to write `start` raw and skip that compensation, so the two UIs disagreed.
+  const timeKeyDown = (edge) => (e) => {
+    if (e.key === 'Enter') e.target.blur();
+    if (e.key === 'Escape') {
+      e.target.value = formatTime(seg[edge]);
+      e.target.blur();
+    }
+  };
+
+  const commitTime = (edge) => (e) => {
+    const v = parseTime(e.target.value);
+    const current = seg[edge];
+    const inRange =
+      edge === 'start'
+        ? v >= 0 && v <= seg.end - MIN_SEG_DUR + TIME_EPSILON
+        : v >= seg.start + MIN_SEG_DUR - TIME_EPSILON;
+    if (v == null || !inRange) {
+      e.target.value = formatTime(current);
+      return;
+    }
+    if (Math.abs(v - current) <= 1e-3) {
+      e.target.value = formatTime(current);
+      return;
+    }
+    const next = +v.toFixed(3);
+    onMoveResize(seg.id, {
+      start: edge === 'start' ? next : seg.start,
+      end: edge === 'end' ? next : seg.end,
+    });
+  };
+
+  const nudgeTime = (edge, delta) => {
+    const current = seg[edge];
+    const limit = edge === 'start' ? seg.end - MIN_SEG_DUR : seg.start + MIN_SEG_DUR;
+    const next = +(
+      edge === 'start'
+        ? Math.max(0, Math.min(limit, current + delta))
+        : Math.max(limit, current + delta)
+    ).toFixed(3);
+    if (Math.abs(next - current) <= 1e-3) return;
+    onMoveResize(seg.id, {
+      start: edge === 'start' ? next : seg.start,
+      end: edge === 'end' ? next : seg.end,
+    });
+  };
+
   const handleTextKeyDown = (e) => {
     if ((e.ctrlKey || e.metaKey) && (e.key === 'd' || e.key === 'D')) {
       e.preventDefault();
@@ -164,7 +238,9 @@ function DubSegmentRow({
       onSplit(seg.id, pos);
     } else if ((e.ctrlKey || e.metaKey) && (e.key === 'm' || e.key === 'M')) {
       e.preventDefault();
-      if (canMerge) onMerge(seg.id);
+      if (e.shiftKey) {
+        if (canMergePrev) onMerge(seg.id, 'prev');
+      } else if (canMerge) onMerge(seg.id, 'next');
     }
   };
 
@@ -198,39 +274,39 @@ function DubSegmentRow({
         title={t('segment.select_title')}
       />
       <span className="segment-time flex flex-col min-w-0 overflow-hidden tabular-nums">
-        <span className="flex items-baseline gap-[2px] min-w-0">
-          <input
-            type="text"
-            className="seg-time-input"
-            defaultValue={formatTime(seg.start)}
-            key={`start-${seg.id}-${seg.start}`}
-            disabled={disabled}
-            title={t('segment.time_edit_title')}
-            onClick={(e) => e.stopPropagation()}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') e.target.blur();
-              if (e.key === 'Escape') {
-                e.target.value = formatTime(seg.start);
-                e.target.blur();
-              }
-            }}
-            onBlur={(e) => {
-              const v = parseTime(e.target.value);
-              if (v == null || v < 0 || v >= seg.end) {
-                e.target.value = formatTime(seg.start);
-                return;
-              }
-              if (Math.abs(v - seg.start) > 1e-3) {
-                onEditField(seg.id, 'start', +v.toFixed(3));
-              } else {
-                e.target.value = formatTime(seg.start);
-              }
-            }}
-          />
-          <span className="text-[var(--chrome-fg-muted)]">–</span>
-          <span className="text-[var(--chrome-fg-muted)] text-[0.62rem]">
-            {formatTime(seg.end)}
+        {['start', 'end'].map((edge) => (
+          <span className="seg-time-stepper" key={`${edge}-${seg.id}-${seg[edge]}`}>
+            <button
+              type="button"
+              onClick={() => nudgeTime(edge, -0.1)}
+              disabled={disabled || (edge === 'start' && seg.start <= 0)}
+              aria-label={t(`segment.time_nudge_${edge}_earlier`)}
+            >
+              <Minus size={10} />
+            </button>
+            <input
+              type="text"
+              className="seg-time-input"
+              defaultValue={formatTime(seg[edge])}
+              disabled={disabled}
+              title={t(
+                edge === 'start' ? 'segment.time_edit_title' : 'segment.time_edit_end_title',
+              )}
+              onClick={(e) => e.stopPropagation()}
+              onKeyDown={timeKeyDown(edge)}
+              onBlur={commitTime(edge)}
+            />
+            <button
+              type="button"
+              onClick={() => nudgeTime(edge, 0.1)}
+              disabled={disabled}
+              aria-label={t(`segment.time_nudge_${edge}_later`)}
+            >
+              <Plus size={10} />
+            </button>
           </span>
+        ))}
+        <span className="flex items-baseline gap-[2px] min-w-0">
           {seg.speed && seg.speed !== 1.0 && (
             <span
               className="text-[0.52rem] ml-[1px]"
@@ -240,6 +316,11 @@ function DubSegmentRow({
             </span>
           )}
         </span>
+        {hasOverlap && (
+          <span className="seg-overlap-warning" title={t('timeline.overlap_warning')}>
+            <AlertCircle size={9} /> {t('timeline.overlap_warning')}
+          </span>
+        )}
         {fitBadge && (
           <span
             className="text-[0.48rem] mt-[1px] inline-flex items-center gap-[1px]"
@@ -275,6 +356,42 @@ function DubSegmentRow({
             📖 {seg.rate_ratio.toFixed(2)}×
           </span>
         )}
+        {/* Pre-synthesis duration plan (backend duration_planner): warn about
+            tight/impossible segments BEFORE GPU time is spent. Informational
+            only — generation is never blocked. */}
+        {seg.plan && (seg.plan.status === 'tight' || seg.plan.status === 'impossible') && (
+          <span
+            className="text-[0.48rem] mt-[1px] inline-flex items-center gap-[1px]"
+            style={{ color: seg.plan.status === 'impossible' ? '#fb4934' : '#fabd2f' }}
+            title={t(
+              seg.plan.status === 'impossible'
+                ? 'segment.plan_impossible_title'
+                : 'segment.plan_tight_title',
+              {
+                est: (seg.plan.est_dur_s || 0).toFixed(1),
+                avail: (seg.plan.available_s || 0).toFixed(1),
+                seconds: (seg.plan.est_overrun_s || 0).toFixed(1),
+              },
+            )}
+          >
+            <AlertCircle size={8} />{' '}
+            {seg.plan.status === 'impossible'
+              ? t('segment.plan_impossible', {
+                  seconds: (seg.plan.est_overrun_s || 0).toFixed(1),
+                })
+              : t('segment.plan_tight')}
+          </span>
+        )}
+        {seg.plan && seg.plan.suggested_text && seg.plan.suggested_text !== seg.text && (
+          <button
+            onClick={() => onEditField(seg.id, 'text', seg.plan.suggested_text)}
+            disabled={disabled}
+            title={t('segment.plan_apply_title', { text: seg.plan.suggested_text })}
+            className="bg-transparent border-none text-[#83a598] cursor-pointer p-0 mt-[1px] text-[0.48rem] text-left"
+          >
+            ✂ {t('segment.plan_apply')}
+          </button>
+        )}
       </span>
 
       <input
@@ -300,36 +417,60 @@ function DubSegmentRow({
       )}
 
       <span className="seg-text-col">
-        <input
-          ref={textInputRef}
-          className="input-base segment-input"
-          value={seg.text}
-          onChange={(e) => onEditField(seg.id, 'text', e.target.value)}
-          onKeyDown={handleTextKeyDown}
-          onKeyUp={captureCursor}
-          onSelect={captureCursor}
-          onClick={(e) => {
-            e.stopPropagation();
-            captureCursor(e);
-          }}
-          disabled={disabled}
-          title={
-            seg.translate_error
-              ? t('segment.translate_error_title', { error: seg.translate_error })
-              : overBudget
-                ? t('segment.budget_title', {
-                    pct: Math.round((seg.text.length / seg.text_original.length) * 100),
-                  })
-                : t('segment.text_title')
-          }
-          style={
-            overBudget
-              ? { background: 'rgba(250,189,47,0.10)' }
-              : seg.translate_error
-                ? { background: 'rgba(251,73,52,0.10)' }
-                : undefined
-          }
-        />
+        <span className="flex items-center gap-[2px] min-w-0">
+          <input
+            ref={textInputRef}
+            className="input-base segment-input"
+            value={seg.text}
+            onChange={(e) => {
+              onEditField(seg.id, 'text', e.target.value);
+              // Live dub preview (opt-in): debounce-stream the edited line.
+              if (liveEnabled) onLiveEdit?.(seg, e.target.value);
+            }}
+            onKeyDown={handleTextKeyDown}
+            onKeyUp={captureCursor}
+            onSelect={captureCursor}
+            onClick={(e) => {
+              e.stopPropagation();
+              captureCursor(e);
+            }}
+            disabled={disabled}
+            title={
+              seg.translate_error
+                ? t('segment.translate_error_title', { error: seg.translate_error })
+                : seg.translate_degraded
+                  ? t('segment.translate_degraded_title', { reason: seg.translate_degraded })
+                  : overBudget
+                    ? t('segment.budget_title', {
+                        pct: Math.round((seg.text.length / seg.text_original.length) * 100),
+                      })
+                    : t('segment.text_title')
+            }
+            style={
+              overBudget
+                ? { background: 'rgba(250,189,47,0.10)' }
+                : seg.translate_error
+                  ? { background: 'rgba(251,73,52,0.10)' }
+                  : undefined
+            }
+          />
+          {liveEnabled && (
+            // Tiny live-preview speaker: pulses while this line streams;
+            // click streams the current text now / stops the active stream.
+            <button
+              type="button"
+              className={`seg-live-btn${liveActive ? ' seg-live-btn--on' : ''}`}
+              disabled={disabled}
+              title={t(liveActive ? 'segment.live_stop_title' : 'segment.live_play_title')}
+              onClick={(e) => {
+                e.stopPropagation();
+                onLiveToggle?.(seg);
+              }}
+            >
+              <Volume2 size={9} />
+            </button>
+          )}
+        </span>
         {seg.text_original && seg.text_original !== seg.text && (
           <span className="text-[0.52rem] text-[#6b6657] flex items-center gap-[3px] px-[2px] overflow-hidden">
             <span className="opacity-80 uppercase font-semibold text-[0.48rem] text-[#7c6f64]">
@@ -372,44 +513,25 @@ function DubSegmentRow({
         ))}
       </select>
 
-      <select
-        className="input-base seg-profile-select"
-        value={seg.profile_id || ''}
-        disabled={disabled}
-        onChange={(e) => onEditField(seg.id, 'profile_id', e.target.value)}
-      >
-        <option value="">{t('segment.voice_default')}</option>
-        {speakerClones && Object.keys(speakerClones).length > 0 && (
-          <optgroup label={t('segment.from_video')}>
-            {Object.keys(speakerClones).map((spk) => {
-              const autoId = `auto:${(spk || '').toLowerCase().replace(/\s+/g, '_')}`;
-              return (
-                <option key={autoId} value={autoId}>
-                  🎤 {spk}
-                </option>
-              );
-            })}
-          </optgroup>
-        )}
-        {profiles.length > 0 && (
-          <optgroup label={t('segment.clone_profiles')}>
-            {profiles.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
-              </option>
-            ))}
-          </optgroup>
-        )}
-        {PRESETS.length > 0 && (
-          <optgroup label={t('segment.design_presets')}>
-            {PRESETS.map((p) => (
-              <option key={p.id} value={`preset:${p.id}`}>
-                {p.name}
-              </option>
-            ))}
-          </optgroup>
-        )}
-      </select>
+      {/* Shared gallery-enabled picker (#1220). `data-noseek` + stopPropagation
+          keep a voice pick from also seeking the player (handleRowClick). The
+          dropdown portals to <body> so it isn't clipped by the react-window
+          virtualized row's overflow. The from-video `auto:<slug>` options come
+          through `speakerClones`; the legacy hardcoded design PRESETS group is
+          intentionally dropped — the Gallery supersedes it (see #1220). */}
+      <span className="seg-voice-col min-w-0" data-noseek onClick={(e) => e.stopPropagation()}>
+        <VoiceSelector
+          value={seg.profile_id || ''}
+          onChange={(v) => onEditField(seg.id, 'profile_id', v)}
+          profiles={profiles}
+          speakerClones={speakerClones}
+          disabled={disabled}
+          size="sm"
+          menuPortal
+          buttonClassName="input-base seg-profile-select"
+          defaultLabel={t('segment.voice_default')}
+        />
+      </span>
 
       <input
         type="range"
@@ -471,12 +593,27 @@ function DubSegmentRow({
               },
             },
             {
+              id: 'merge-prev',
+              label: t('segment.merge_prev_label'),
+              icon: Merge,
+              shortcut: '⇧⌘M',
+              disabled: !canMergePrev,
+              onSelect: () => onMerge(seg.id, 'prev'),
+            },
+            {
               id: 'merge',
               label: t('segment.merge_label'),
               icon: Merge,
               shortcut: '⌘M',
               disabled: !canMerge,
-              onSelect: () => onMerge(seg.id),
+              onSelect: () => onMerge(seg.id, 'next'),
+            },
+            'separator',
+            {
+              id: 'insert',
+              label: t('segment.insert_label'),
+              icon: Plus,
+              onSelect: () => onInsert(seg.id),
             },
           ]}
         >
@@ -514,7 +651,12 @@ export default memo(
     prev.onSeek === next.onSeek &&
     prev.selected === next.selected &&
     prev.canMerge === next.canMerge &&
+    prev.canMergePrev === next.canMergePrev &&
     prev.profiles === next.profiles &&
     prev.speakerClones === next.speakerClones &&
+    prev.liveEnabled === next.liveEnabled &&
+    prev.liveActive === next.liveActive &&
+    prev.onLiveEdit === next.onLiveEdit &&
+    prev.onLiveToggle === next.onLiveToggle &&
     prev.idx === next.idx,
 );

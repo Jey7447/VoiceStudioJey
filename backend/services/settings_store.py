@@ -1,4 +1,4 @@
-"""Encrypted settings store for OmniVoice — AUTH-02 + threat T-01-01.
+"""Encrypted settings store for VoiceStudio — AUTH-02 + threat T-01-01.
 
 Persists small key/value rows in the SQLite `settings` table. The `hf_token`
 row is encrypted at rest via Fernet (symmetric AEAD). The Fernet key itself
@@ -13,8 +13,10 @@ Public API (consumed by `token_resolver.py`):
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from typing import Optional
+from core.logging_utils import log_safe
 
 logger = logging.getLogger("omnivoice.settings_store")
 
@@ -148,18 +150,20 @@ def get_secret(name: str) -> Optional[str]:
         try:
             from cryptography.fernet import InvalidToken
         except ImportError:  # pragma: no cover — dep should always be present
-            logger.error("cryptography unavailable; cannot decrypt secret %s", name)
+            logger.error("cryptography unavailable; encrypted setting cannot be decrypted")
             return None
         try:
             return _fernet().decrypt(row[0].encode("ascii")).decode("utf-8")
         except InvalidToken:
             logger.warning(
-                "Stored secret %r failed to decrypt (install moved across "
-                "machines or salt tampered) — falling back to env/default.", name,
+                "Stored encrypted setting failed to decrypt (install moved across "
+                "machines or salt tampered) — falling back to env/default."
             )
             return None
-    except Exception:
-        logger.exception("settings_store.get_secret(%s): SQLite read failed", name)
+    except sqlite3.Error:
+        # This path may hold plaintext/ciphertext secret values in locals.
+        # Keep the record fixed-shape; never attach exception state or traceback.
+        logger.error("settings_store.get_secret: SQLite read failed")
         return None
 
 
@@ -242,9 +246,37 @@ def get_text(key: str, default: Optional[str] = None) -> Optional[str]:
         if row is None or row[0] is None:
             return default
         return str(row[0])
-    except Exception:
-        logger.exception("settings_store.get_text(%s): SQLite read failed", key)
+    except Exception as exc:
+        logger.error(
+            "settings_store.get_text(%s): SQLite read failed: %s",
+            log_safe(key), log_safe(exc),
+        )
         return default
+
+
+def get_text_state(key: str) -> tuple[bool, str]:
+    """Return ``(is_present, value)`` without hiding storage failures.
+
+    Rollback snapshots must distinguish a missing row from an unreadable
+    database.  ``get_text`` deliberately collapses those cases for ordinary
+    preference reads, so transactional callers use this strict variant.
+    """
+    if key == _TOKEN_KEY or key.startswith(_SECRET_PREFIX):
+        raise ValueError(
+            "get_text_state refuses to read an encrypted secret row; "
+            "use get_hf_token()/get_secret() for secrets"
+        )
+    from core.db import db_conn
+
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+    if row is None:
+        return False, ""
+    if row[0] is None:
+        return True, ""
+    return True, str(row[0])
 
 
 def set_text(key: str, value: str) -> None:
@@ -265,6 +297,19 @@ def set_text(key: str, value: str) -> None:
             "VALUES (?, ?, ?)",
             (key, value, time.time()),
         )
+
+
+def clear_text(key: str) -> None:
+    """Remove a non-encrypted text setting, preserving a missing-row default."""
+    if key == _TOKEN_KEY or key.startswith(_SECRET_PREFIX):
+        raise ValueError(
+            "clear_text refuses to delete an encrypted secret row; "
+            "use clear_hf_token()/clear_secret() for secrets"
+        )
+    from core.db import db_conn
+
+    with db_conn() as conn:
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
 
 
 # ── Phase 4 Plan 04-01 (GGUF-04): per-engine quant override ────────────────

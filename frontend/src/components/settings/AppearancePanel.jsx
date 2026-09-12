@@ -21,6 +21,71 @@ const THEMES = [
   { id: 'catppuccin', label: 'Catppuccin', dot: '#cba6f7' },
 ];
 
+/**
+ * WAI-ARIA radio-group keyboard support for the theme-dot / font-tile pickers:
+ * arrow keys move selection (wrapping), Home/End jump to the ends, and focus
+ * follows selection. Pair with `radioTabIndex` for the roving tabindex so the
+ * group occupies a single tab stop, as the announced role promises.
+ */
+function radioGroupKeyDown(e, values, current, select) {
+  const STEP = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 };
+  let next;
+  if (e.key in STEP) {
+    const idx = Math.max(0, values.indexOf(current));
+    next = values[(idx + STEP[e.key] + values.length) % values.length];
+  } else if (e.key === 'Home') {
+    next = values[0];
+  } else if (e.key === 'End') {
+    next = values[values.length - 1];
+  }
+  if (!next) return;
+  e.preventDefault();
+  select(next);
+  const el = e.currentTarget
+    .closest('[role="radiogroup"]')
+    ?.querySelector(`[data-radio-value="${next}"]`);
+  el?.focus();
+}
+
+/** Roving tabindex: only the checked radio (or the first, if none is checked
+ * — e.g. a stale persisted value) is tabbable. */
+function radioTabIndex(values, current, value) {
+  const focusable = values.includes(current) ? current : values[0];
+  return value === focusable ? 0 : -1;
+}
+
+/**
+ * Miniature of each navigation skin — the tile shows the layout instead of
+ * describing it, because "rail" vs "tabs" is a shape, not a word.
+ */
+function NavStylePreview({ style }) {
+  if (style === 'tabs') {
+    return (
+      <span className="appearance-panel__nav-preview" aria-hidden="true">
+        <span className="appearance-panel__nav-preview-bar">
+          <span className="appearance-panel__nav-preview-tab is-active" />
+          <span className="appearance-panel__nav-preview-tab" />
+          <span className="appearance-panel__nav-preview-tab" />
+        </span>
+        <span className="appearance-panel__nav-preview-plane" />
+      </span>
+    );
+  }
+  return (
+    <span
+      className="appearance-panel__nav-preview appearance-panel__nav-preview--rail"
+      aria-hidden="true"
+    >
+      <span className="appearance-panel__nav-preview-rail">
+        <span className="appearance-panel__nav-preview-dot is-active" />
+        <span className="appearance-panel__nav-preview-dot" />
+        <span className="appearance-panel__nav-preview-dot" />
+      </span>
+      <span className="appearance-panel__nav-preview-plane" />
+    </span>
+  );
+}
+
 export default function AppearancePanel() {
   const { t } = useTranslation();
   const uiScale = useAppStore((s) => s.uiScale);
@@ -33,10 +98,20 @@ export default function AppearancePanel() {
   const setAutoPlayPreview = useAppStore((s) => s.setAutoPlayPreview);
   const showHeaderLiveStats = useAppStore((s) => s.showHeaderLiveStats);
   const setShowHeaderLiveStats = useAppStore((s) => s.setShowHeaderLiveStats);
+  const navStyle = useAppStore((s) => s.navStyle);
+  const setNavStyle = useAppStore((s) => s.setNavStyle);
 
   const scaleLabel = t('settings.ui_scale', { defaultValue: 'UI scale' });
   const themeLabel = t('settings.color_theme', { defaultValue: 'Color theme' });
   const fontLabel = t('settings.font', { defaultValue: 'Font' });
+  const themeIds = THEMES.map((th) => th.id);
+  const fontIds = FONT_OPTIONS.map((f) => f.id);
+  const navStyleLabel = t('settings.nav_style', { defaultValue: 'Navigation style' });
+  const navStyles = [
+    { id: 'rail', label: t('settings.nav_style_rail', { defaultValue: 'Sidebar rail' }) },
+    { id: 'tabs', label: t('settings.nav_style_tabs', { defaultValue: 'Titlebar tabs' }) },
+  ];
+  const navStyleIds = navStyles.map((n) => n.id);
 
   return (
     <SettingsSection
@@ -52,6 +127,43 @@ export default function AppearancePanel() {
         </InfoHint>
       }
     >
+      <SettingRow
+        className="appearance-panel__row--nav-style"
+        stack
+        align="start"
+        title={navStyleLabel}
+        subtitle={t('settings.nav_style_desc', {
+          defaultValue:
+            'Switch workspaces from an icon rail down the window edge, or from tabs across the title bar.',
+        })}
+        control={
+          <div
+            className="flex flex-wrap gap-[var(--space-3)]"
+            role="radiogroup"
+            aria-label={navStyleLabel}
+          >
+            {navStyles.map((n) => (
+              <button
+                key={n.id}
+                type="button"
+                role="radio"
+                aria-checked={navStyle === n.id}
+                aria-label={n.label}
+                tabIndex={radioTabIndex(navStyleIds, navStyle, n.id)}
+                data-radio-value={n.id}
+                data-testid={`appearance-nav-style-${n.id}`}
+                className={`appearance-panel__nav-tile ${navStyle === n.id ? 'is-active' : ''}`}
+                onClick={() => setNavStyle(n.id)}
+                onKeyDown={(e) => radioGroupKeyDown(e, navStyleIds, navStyle, setNavStyle)}
+              >
+                <NavStylePreview style={n.id} />
+                <span className="appearance-panel__nav-name">{n.label}</span>
+              </button>
+            ))}
+          </div>
+        }
+      />
+
       <SettingRow
         title={scaleLabel}
         control={
@@ -89,10 +201,13 @@ export default function AppearancePanel() {
                 className={`appearance-panel__theme-dot ${theme === th.id ? 'is-active' : ''}`}
                 style={{ '--dot-color': th.dot }}
                 onClick={() => setTheme(th.id)}
+                onKeyDown={(e) => radioGroupKeyDown(e, themeIds, theme, setTheme)}
                 title={th.label}
                 aria-label={th.label}
                 aria-checked={theme === th.id}
                 role="radio"
+                tabIndex={radioTabIndex(themeIds, theme, th.id)}
+                data-radio-value={th.id}
               />
             ))}
           </div>
@@ -117,10 +232,13 @@ export default function AppearancePanel() {
                 role="radio"
                 aria-checked={font === f.id}
                 aria-label={f.label}
+                tabIndex={radioTabIndex(fontIds, font, f.id)}
+                data-radio-value={f.id}
                 data-testid={`appearance-font-${f.id}`}
                 className={`appearance-panel__font-tile ${font === f.id ? 'is-active' : ''}`}
                 style={{ fontFamily: FONT_STACKS[f.id] || 'var(--font-sans)' }}
                 onClick={() => setFont(f.id)}
+                onKeyDown={(e) => radioGroupKeyDown(e, fontIds, font, setFont)}
               >
                 <span className="appearance-panel__font-sample">Ag</span>
                 <span className="appearance-panel__font-name">{f.label}</span>

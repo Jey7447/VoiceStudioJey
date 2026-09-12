@@ -6,6 +6,13 @@ if (import.meta.env.DEV && !window.__vite_plugin_react_preamble_installed__) {
   window.__vite_plugin_react_preamble_installed__ = true;
 }
 
+// Web-platform gap fills for the oldest WebView we support (macOS 13.3 ships
+// WKWebView 16.4; Linux takes whatever WebKitGTK the distro has, which is the
+// version we cannot pin). MUST be first: these are touched during the first React
+// render, so a missing one throws mid-render and leaves a dead window rather
+// than a degraded feature (#1245).
+import './utils/webCompat.js';
+
 // AudioContext autoplay-policy unlock — MUST install before any module that
 // constructs an AudioContext (wavesurfer.js, the AEC tap, the dictation
 // capture, etc.). The side-effecting import patches `window.AudioContext`
@@ -49,9 +56,16 @@ window.addEventListener('mousedown', (e) => {
 // vite surfaces that as "Unable to preload CSS for /assets/…". The documented
 // recovery is a one-time reload to pick up the fresh manifest. The session
 // flag prevents a reload loop if the asset is genuinely missing.
-window.addEventListener('vite:preloadError', (event) => {
+window.addEventListener('vite:preloadError', async (event) => {
   if (sessionStorage.getItem('omnivoice.preloadErrorReloaded') === '1') return;
   sessionStorage.setItem('omnivoice.preloadErrorReloaded', '1');
   event.preventDefault();
-  window.location.reload();
+  try {
+    const { reloadAfterApplicationPersistence } = await import('./utils/persistenceLifecycle');
+    await reloadAfterApplicationPersistence();
+  } catch {
+    // The old hashed persistence chunk may be the asset that disappeared.
+    // Recovery still needs to reach the fresh manifest in that case.
+    window.location.reload();
+  }
 });

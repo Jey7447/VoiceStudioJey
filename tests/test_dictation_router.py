@@ -3,6 +3,7 @@ Tests for the dictation router (GET /dictation/models, GET/POST /dictation/prefs
 — the exact contract the frontend dictation UI binds to.
 """
 import os
+import importlib
 
 import pytest
 
@@ -34,7 +35,7 @@ def test_list_models_shape(client):
     r = client.get("/dictation/models")
     assert r.status_code == 200
     body = r.json()
-    assert body["default_model_id"] == "sherpa-parakeet-tdt-v3"
+    assert body["default_model_id"] == "sherpa-whisper-tiny"
     assert len(body["models"]) == 7
     keys = {"id", "repo_id", "label", "tag", "recommended", "size_gb",
             "languages", "kind", "installed"}
@@ -42,7 +43,20 @@ def test_list_models_shape(client):
         assert keys <= set(m), f"missing keys in {m}"
         assert m["tag"] in ("offline", "streaming")
     rec = [m for m in body["models"] if m["recommended"]]
-    assert [m["id"] for m in rec] == ["sherpa-parakeet-tdt-v3"]
+    assert [m["id"] for m in rec] == ["sherpa-whisper-tiny"]
+
+
+def test_list_models_omits_probe_diagnostic(client, monkeypatch):
+    from api.routers import dictation as dr
+
+    private = "Traceback: token=private-value at /home/alice/sherpa.py"
+    monkeypatch.setattr(dr.sd, "sherpa_available", lambda: (False, private))
+    body = client.get("/dictation/models").json()
+    assert body["engine_available"] is False
+    assert body["engine_reason"] == (
+        "Engine unavailable. Check installation and configuration."
+    )
+    assert private not in repr(body)
 
 
 def test_get_prefs_defaults(client):
@@ -50,7 +64,7 @@ def test_get_prefs_defaults(client):
     assert r.status_code == 200
     body = r.json()
     assert body == {"enabled": True, "mode": "toggle",
-                    "model_id": "sherpa-parakeet-tdt-v3"}
+                    "model_id": "sherpa-whisper-tiny"}
 
 
 def test_set_prefs_persists_and_validates(client):
@@ -78,3 +92,23 @@ def test_set_prefs_accepts_repo_id_and_normalizes(client):
     assert r.status_code == 200
     # Stored as the canonical dictation id, not the repo_id.
     assert r.json()["model_id"] == "sherpa-whisper-tiny"
+
+
+def test_reset_failure_does_not_persist_new_preferences(monkeypatch):
+    services = importlib.import_module("services")
+    from api.routers import dictation as dr
+
+    store = {dr.PREF_MODE: "toggle"}
+    monkeypatch.setattr(dr.prefs, "get", lambda key, default=None: store.get(key, default))
+    monkeypatch.setattr(dr.prefs, "set_", lambda key, value: store.__setitem__(key, value))
+
+    class _BrokenBackend:
+        def __setattr__(self, _name, _value):
+            raise RuntimeError("capture service unavailable")
+
+    monkeypatch.setattr(services, "asr_backend", _BrokenBackend())
+    with pytest.raises(Exception) as caught:
+        dr.set_dictation_prefs(dr.DictationPrefsUpdate(mode="hold"))
+
+    assert getattr(caught.value, "status_code", None) == 503
+    assert store == {dr.PREF_MODE: "toggle"}

@@ -36,10 +36,96 @@ export function segmentGenInputs(s) {
 }
 
 /** The `auto:<safe>` profile id for a diarized speaker. Mirrors the backend's
- *  clone-resolution key (`speaker_id.lower().replace(" ", "_")`) and the
- *  Voice-dropdown option value in DubTab, so the three always agree. */
+ *  portable filename/profile slug and is shared by every voice picker. */
 export function autoProfileId(speakerId) {
-  return `auto:${(speakerId || '').toLowerCase().replace(/\s+/g, '_')}`;
+  const cleaned = [];
+  for (const char of String(speakerId || '').toLowerCase()) {
+    if (/^[\p{L}\p{N}]$/u.test(char)) cleaned.push(char);
+    else if (char === ' ' || char === '-') cleaned.push('_');
+  }
+  return `auto:${cleaned.join('') || 'speaker'}`;
+}
+
+/** Active merged parts for cast lookup. An empty `merge_parts` means the
+ * editable projection was cleared; the original attribution remains the
+ * canonical source for speakers and their assigned voices. */
+export function castParts(segment) {
+  if (Array.isArray(segment?.merge_parts) && segment.merge_parts.length) {
+    return segment.merge_parts;
+  }
+  return Array.isArray(segment?.merge_parts_original) ? segment.merge_parts_original : [];
+}
+
+/**
+ * The one per-speaker cast mutation: give every segment (and merged part)
+ * spoken by `speakerId` the voice `profileId`. Shared by the CAST dropdowns
+ * and the casting board so a drag-and-drop writes exactly the fields the
+ * <select> always has — `profile_id` on directly-matching segments, plus
+ * `merge_parts` / `merge_parts_original` attribution on merged rows (a merged
+ * row keeps its own top-level voice when only a nested part's speaker moves).
+ */
+export function assignSpeakerProfile(segments, speakerId, profileId) {
+  return (segments || []).map((s) => {
+    const directMatch = s.speaker_id === speakerId;
+    const nestedMatch = castParts(s).some((part) => part.speaker_id === speakerId);
+    if (!directMatch && !nestedMatch) return s;
+    return {
+      ...s,
+      ...(directMatch ? { profile_id: profileId } : {}),
+      ...(s.merge_parts
+        ? {
+            merge_parts: s.merge_parts.map((part) =>
+              part.speaker_id === speakerId ? { ...part, profile_id: profileId } : part,
+            ),
+          }
+        : {}),
+      ...(s.merge_parts_original
+        ? {
+            merge_parts_original: s.merge_parts_original.map((part) =>
+              part.speaker_id === speakerId ? { ...part, profile_id: profileId } : part,
+            ),
+          }
+        : {}),
+    };
+  });
+}
+
+/** Every distinct diarized speaker in cast order — top-level ids first-seen,
+ *  including speakers that only survive inside merged rows' `merge_parts`. */
+export function castSpeakers(segments) {
+  return [
+    ...new Set(
+      (segments || [])
+        .flatMap((s) => [s.speaker_id, ...castParts(s).map((part) => part.speaker_id)])
+        .filter(Boolean),
+    ),
+  ];
+}
+
+/** Recover path-free cast metadata from current or legacy job payloads. */
+export function castSourcesFromJob(job) {
+  if (!job || typeof job !== 'object') return {};
+  const sources = {};
+  for (const [speaker, info] of Object.entries(job.cast_sources || job.speaker_clones || {})) {
+    if (!info || typeof info !== 'object') continue;
+    sources[speaker] = {
+      duration: Number(info.duration) || 0,
+      source_count: Number(info.source_count) || 1,
+      kind: info.kind === 'segment' ? 'segment' : 'speaker',
+    };
+  }
+  for (const segment of job.segments || []) {
+    const speaker = segment?.speaker_id || 'Speaker 1';
+    const current = sources[speaker];
+    if (current && current.kind !== 'segment') continue;
+    const info = (job.segment_clones || {})[String(segment?.id ?? '')];
+    if (!info?.ref_audio) continue;
+    const duration = Number(info.duration) || 0;
+    if (!current || duration > current.duration) {
+      sources[speaker] = { duration, source_count: 1, kind: 'segment' };
+    }
+  }
+  return sources;
 }
 
 /**

@@ -18,14 +18,17 @@ export const COMPONENTS = [
   'Table',
   'Tabs',
   'Input',
-  // shadcn/ui proof components (themed via the OmniVoice token bridge).
+  // shadcn/ui proof components (themed via the VoiceStudio token bridge).
   'ShadcnButton',
   'ShadcnInput',
   // Provider-wrapped PANEL specs — rendered with a seeded store / i18n /
   // react-query / fetch (see specs.jsx `providers`). Same snapshot loop.
   'AppearancePanel',
+  'TitleTabs',
   'GeneralTab',
   'StoragePanel',
+  'ResetPanel',
+  'UninstallPanel',
 ] as const;
 
 export const THEMES = ['default', 'midnight', 'catppuccin'] as const;

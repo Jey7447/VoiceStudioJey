@@ -17,20 +17,50 @@ import {
   Trash2,
   Play,
   Download,
+  Activity,
 } from 'lucide-react';
-import { Button, Badge } from '../../ui';
+import { Button, Progress } from '../../ui';
+import { useEffect, useRef } from 'react';
 import WaveformTimeline from '../WaveformTimeline';
 import DubbingDemo from '../DubbingDemo';
 import DubFailureNotice from './DubFailureNotice';
 import PrepOverlay from './PrepOverlay';
 import TranscribeOverlay from './TranscribeOverlay';
-import { LANG_CODES } from '../../utils/languages';
+import { LANG_CODES, languageLabel } from '../../utils/languages';
 
 const SPEAKERS_INPUT =
   'w-[52px] ml-[4px] px-[6px] py-[4px] rounded-[6px] border border-[var(--border,#3c3836)] bg-[var(--input-bg,#282828)] text-inherit text-[12px]';
 
+function AsrInstallStatus({ t, install, onAbort }) {
+  const pct = typeof install?.percent === 'number' ? Math.round(install.percent) : null;
+  return (
+    <div
+      className="flex flex-col items-center gap-[var(--space-5)] w-full"
+      role="status"
+      aria-live="polite"
+    >
+      <Loader className="spinner" size={20} color="#d3869b" aria-hidden="true" />
+      <span className="text-fg font-medium text-[var(--text-lg)]">
+        {t('dub.install_progress', { engine: install?.label })}
+      </span>
+      <div className="w-[80%] max-w-[340px]">
+        <Progress value={pct} tone="brand" size="sm" />
+      </div>
+      {pct != null && (
+        <span className="text-[var(--text-sm)] text-fg-muted [font-variant-numeric:tabular-nums]">
+          {pct}%
+        </span>
+      )}
+      <Button variant="danger" size="sm" onClick={onAbort}>
+        {t('dub.prep_stop')}
+      </Button>
+    </div>
+  );
+}
+
 export default function IdleSkeleton({
   t,
+  uiLocale,
   dubVideoFile,
   activeProjectName,
   dubFilename,
@@ -38,6 +68,8 @@ export default function IdleSkeleton({
   dubJobId,
   dubStep,
   dubFailure,
+  asrInstall,
+  handleInstallMissingAsr,
   handleDubRetryTranscribe,
   handleDubImportSrt,
   dubLocalBlobUrl,
@@ -45,6 +77,7 @@ export default function IdleSkeleton({
   dubPrepProgress,
   handleDubAbort,
   transcribeElapsed,
+  transcribeProgress,
   dubDuration,
   dubNumSpeakers,
   setDubNumSpeakers,
@@ -61,14 +94,25 @@ export default function IdleSkeleton({
   onIngestUrl,
   fetchYtSubs,
   setFetchYtSubs,
+  youtubeCookieFile,
+  setYoutubeCookieFile,
   dubLangCode,
+  dubSourceLangCode,
+  setDubSourceLangCode,
   setDubLangCode,
   setDubLang,
   landingAdvOpen,
   setLandingAdvOpen,
   dubInstruct,
   setDubInstruct,
+  onOpenQueue,
 }) {
+  const youtubeCookieInputRef = useRef(null);
+  useEffect(() => {
+    if (!youtubeCookieFile && youtubeCookieInputRef.current) {
+      youtubeCookieInputRef.current.value = '';
+    }
+  }, [youtubeCookieFile]);
   return (
     <div className="flex-1 flex flex-col min-h-0">
       {/* Header bar */}
@@ -116,11 +160,23 @@ export default function IdleSkeleton({
               Surfaces the backend error detail and offers one-click retry,
               which re-runs the ASR stream on the same job without re-uploading. */}
       {dubError && dubJobId && dubStep === 'idle' && (
-        <div className="mb-[var(--space-2)]">
-          <Badge tone="danger">
-            <AlertCircle size={11} /> {dubError}
-          </Badge>
+        <div
+          className="mb-[var(--space-2)] flex flex-wrap items-center gap-[var(--space-2)] rounded-md border border-transparent bg-[rgba(251,73,52,0.08)] px-[12px] py-[9px]"
+          role="alert"
+        >
+          <AlertCircle size={15} className="shrink-0 text-danger" aria-hidden="true" />
+          <span className="min-w-0 flex-1 text-[var(--text-sm)] text-fg break-words">
+            {dubError}
+          </span>
           <DubFailureNotice failure={dubFailure} />
+          {asrInstall?.phase === 'missing' && asrInstall.repoId && (
+            <Button variant="primary" size="sm" onClick={handleInstallMissingAsr}>
+              {t('asr_missing.download', {
+                label: asrInstall.label,
+                size: asrInstall.sizeGb,
+              })}
+            </Button>
+          )}
           {handleDubRetryTranscribe && (
             <Button
               variant="subtle"
@@ -179,9 +235,12 @@ export default function IdleSkeleton({
                       progress={dubPrepProgress}
                       onAbort={handleDubAbort}
                     />
+                  ) : dubStep === 'installing-asr' ? (
+                    <AsrInstallStatus t={t} install={asrInstall} onAbort={handleDubAbort} />
                   ) : dubStep === 'transcribing' ? (
                     <TranscribeOverlay
                       elapsed={transcribeElapsed}
+                      progress={transcribeProgress}
                       duration={dubDuration}
                       onAbort={handleDubAbort}
                     />
@@ -216,6 +275,26 @@ export default function IdleSkeleton({
                     />
                   </label>
                 )}
+                <label className="inline-flex items-center gap-[5px] text-[12px] text-[var(--muted,#a89984)] whitespace-nowrap">
+                  <Globe size={13} /> {t('dub.source_language')}
+                  <select
+                    className="input-base text-[0.65rem]"
+                    value={dubSourceLangCode}
+                    disabled={
+                      dubStep === 'uploading' ||
+                      dubStep === 'transcribing' ||
+                      dubStep === 'installing-asr'
+                    }
+                    onChange={(event) => setDubSourceLangCode(event.target.value)}
+                  >
+                    <option value="auto">{t('bootstrap.auto_detect')}</option>
+                    {LANG_CODES.map((language) => (
+                      <option key={language.code} value={language.code}>
+                        {languageLabel(language.code, uiLocale, language.label)} — {language.code}
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <label
                   className="inline-flex items-center gap-[5px] text-[12px] text-[var(--muted,#a89984)] whitespace-nowrap"
                   title={t('dub.num_speakers_help')}
@@ -240,7 +319,11 @@ export default function IdleSkeleton({
                   variant="primary"
                   className="flex-1"
                   onClick={handleDubUpload}
-                  disabled={dubStep === 'uploading' || dubStep === 'transcribing'}
+                  disabled={
+                    dubStep === 'uploading' ||
+                    dubStep === 'transcribing' ||
+                    dubStep === 'installing-asr'
+                  }
                 >
                   {dubStep === 'uploading' || dubStep === 'transcribing' ? (
                     <>
@@ -261,6 +344,10 @@ export default function IdleSkeleton({
               onAbort={handleDubAbort}
               large
             />
+          ) : dubStep === 'installing-asr' ? (
+            <div className="flex-1 flex flex-col items-center justify-center min-h-0">
+              <AsrInstallStatus t={t} install={asrInstall} onAbort={handleDubAbort} />
+            </div>
           ) : dubStep === 'transcribing' ? (
             // URL-ingest / restored jobs have no local `dubVideoFile`, so the
             // waveform-overlay branch above never runs for them. Without this
@@ -272,6 +359,7 @@ export default function IdleSkeleton({
             <div className="flex-1 flex flex-col items-center justify-center min-h-0">
               <TranscribeOverlay
                 elapsed={transcribeElapsed}
+                progress={transcribeProgress}
                 duration={dubDuration}
                 onAbort={handleDubAbort}
               />
@@ -373,12 +461,74 @@ export default function IdleSkeleton({
                   />
                   <span>{t('dub.pull_captions')}</span>
                 </label>
+                <div
+                  className="flex items-center gap-[6px] mt-[4px] text-[0.62rem] text-fg-muted"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }}
+                >
+                  <span>{t('dub.youtube_auth')}</span>
+                  <input
+                    ref={youtubeCookieInputRef}
+                    type="file"
+                    accept=".txt,text/plain"
+                    aria-label={t('dub.youtube_cookie_file')}
+                    className="max-w-[230px] text-[0.6rem] file:mr-[6px] file:rounded-[4px] file:border-0 file:px-[7px] file:py-[3px] file:bg-[rgba(255,255,255,0.08)] file:text-fg file:cursor-pointer"
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => setYoutubeCookieFile(e.target.files?.[0] || null)}
+                  />
+                  {youtubeCookieFile && (
+                    <button
+                      type="button"
+                      className="text-fg-muted hover:text-fg"
+                      onClick={() => setYoutubeCookieFile(null)}
+                      aria-label={t('dub.remove_cookie_file')}
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+                {/* Quiet path into the batch dubbing queue — the queue page
+                    itself (many videos × many languages, plus the watch
+                    folder) had no UI entry point anywhere in the app. */}
+                <button
+                  type="button"
+                  data-testid="dub-open-batch-queue"
+                  className="mt-[8px] inline-flex cursor-pointer items-center gap-[6px] rounded-[4px] border-0 bg-[rgba(255,255,255,0.02)] px-[8px] py-[4px] text-[0.62rem] text-fg-muted hover:bg-[rgba(255,255,255,0.05)] hover:text-fg"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onOpenQueue?.();
+                  }}
+                >
+                  <Activity size={11} aria-hidden="true" />
+                  <span>{t('dub.batch_queue_link')}</span>
+                </button>
               </label>
 
               {/* One decision up front: the target language. Everything else
                     (speakers, style) hides behind Advanced — ElevenLabs-style
-                    flow, OmniVoice chrome. The pick pre-seeds the editor. */}
+                    flow, VoiceStudio chrome. The pick pre-seeds the editor. */}
               <div className="flex items-center justify-between gap-[10px] mt-[10px] px-[10px] py-[8px] [border:1px_solid_var(--chrome-border)] rounded-[10px] bg-[var(--chrome-hover-bg)]">
+                <label className="dub-landing-opts__lang inline-flex items-center gap-[7px] min-w-0 text-[var(--chrome-fg-muted)]">
+                  <Globe size={13} />
+                  <span className="text-[0.72rem] font-medium whitespace-nowrap">
+                    {t('dub.source_language')}
+                  </span>
+                  <select
+                    className="input-base text-[0.65rem]"
+                    value={dubSourceLangCode}
+                    onChange={(event) => setDubSourceLangCode(event.target.value)}
+                  >
+                    <option value="auto">{t('bootstrap.auto_detect')}</option>
+                    {LANG_CODES.map((language) => (
+                      <option key={language.code} value={language.code}>
+                        {languageLabel(language.code, uiLocale, language.label)} — {language.code}
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <label className="dub-landing-opts__lang inline-flex items-center gap-[7px] min-w-0 text-[var(--chrome-fg-muted)]">
                   <Globe size={13} />
                   <span className="text-[0.72rem] font-medium whitespace-nowrap">
@@ -395,7 +545,7 @@ export default function IdleSkeleton({
                   >
                     {LANG_CODES.map((lc) => (
                       <option key={lc.code} value={lc.code}>
-                        {lc.label} — {lc.code}
+                        {languageLabel(lc.code, uiLocale, lc.label)} — {lc.code}
                       </option>
                     ))}
                   </select>
@@ -458,6 +608,9 @@ export default function IdleSkeleton({
             accept="video/*,audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg,.opus,.wma"
             id="video-upload"
             className="hidden"
+            disabled={
+              dubStep === 'uploading' || dubStep === 'transcribing' || dubStep === 'installing-asr'
+            }
             onChange={(e) => {
               const file = e.target.files[0];
               if (!file) return;

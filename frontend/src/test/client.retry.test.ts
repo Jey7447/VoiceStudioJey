@@ -39,6 +39,19 @@ describe('apiFetch transport-retry', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('can disable transport retries for one-shot capability requests', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(apiFetch('/one-shot', { retryTransport: false })).rejects.toMatchObject({
+      status: 0,
+    });
+    const transportCalls = fetchMock.mock.calls.filter((call) =>
+      String(call[0]).endsWith('/one-shot'),
+    );
+    expect(transportCalls).toHaveLength(1);
+  });
+
   it('does NOT call fetch once the signal is already aborted', async () => {
     const fetchMock = vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
     vi.stubGlobal('fetch', fetchMock);
@@ -60,7 +73,10 @@ describe('apiFetch transport-retry', () => {
     const assertion = expect(p).rejects.toMatchObject({ status: 0 });
     await vi.advanceTimersByTimeAsync(400 + 900 + 1600 + 100);
     await assertion;
-    // initial attempt + 3 bounded retries
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    // initial attempt + 3 bounded retries. Count only the transport attempts
+    // against the requested path — the give-up branch also probes the crash
+    // forensics endpoint in browser mode (#1164), which is not a retry.
+    const transportCalls = fetchMock.mock.calls.filter((c) => String(c[0]).endsWith('/x'));
+    expect(transportCalls).toHaveLength(4);
   });
 });

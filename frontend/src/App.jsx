@@ -9,8 +9,11 @@ import React, {
 } from 'react';
 import './index.css';
 import { useAppStore, FONT_STACKS } from './store';
+import { NAV_ITEMS } from './components/navItems';
 import SearchableSelect from './components/SearchableSelect';
 import DirectionDialog from './components/DirectionDialog';
+import ModeLifecycleBoundary from './components/ModeLifecycleBoundary';
+import { resolveDubDefaultTrack } from './utils/dubDefaultTrack';
 
 // Lazy-load heavy/conditional components so they don't bloat the initial bundle.
 const AudioTrimmer = lazy(() => import('./components/AudioTrimmer'));
@@ -24,24 +27,34 @@ const VoiceProfile = lazy(() => import('./pages/VoiceProfile'));
 const BatchQueue = lazy(() => import('./pages/BatchQueue'));
 const ToolsPage = lazy(() => import('./pages/ToolsPage'));
 const SetupWizard = lazy(() => import('./pages/SetupWizard'));
+const UiScaleSetup = lazy(() => import('./components/UiScaleSetup'));
 const KeyboardCheatsheet = lazy(() => import('./components/KeyboardCheatsheet'));
 const VoicePreview = lazy(() => import('./components/VoicePreview'));
 const LogsFooter = lazy(() => import('./components/LogsFooter'));
 const ProjectsPage = lazy(() => import('./pages/Projects'));
 const VoiceGallery = lazy(() => import('./pages/VoiceGallery'));
 const SupportPage = lazy(() => import('./pages/SupportPage'));
-const ContactPage = lazy(() => import('./pages/ContactPage'));
 const TranscriptionsPage = lazy(() => import('./pages/Transcriptions'));
 const StoriesEditor = lazy(() => import('./components/StoriesEditor'));
 const AudiobookTab = lazy(() => import('./pages/AudiobookTab'));
+const ModelCataloguePage = lazy(() => import('./pages/ModelCatalogue'));
 
 import Header from './components/Header';
 import NavRail from './components/NavRail';
+import TitleTabs from './components/TitleTabs';
 import WorkspaceHistory from './components/WorkspaceHistory';
 import WorkspaceVoices from './components/WorkspaceVoices';
 import WorkspaceProjects from './components/WorkspaceProjects';
 import ErrorBoundary from './components/ErrorBoundary';
 import FloatingPill from './components/FloatingPill';
+import GlobalAudioPlayer from './components/GlobalAudioPlayer';
+import BackendCrashNotice from './components/BackendCrashNotice';
+import BackendStartFailureNotice from './components/BackendStartFailureNotice';
+import RemoteBackendRecovery from './components/RemoteBackendRecovery';
+import AnalyticsConsentBanner from './components/AnalyticsConsentBanner';
+import LanguageSwitchPrompt from './components/LanguageSwitchPrompt';
+import { initAnalyticsFromConsent } from './utils/analytics';
+import BackendRestartBanner from './components/BackendRestartBanner';
 // RemoteAuthGate is mounted at the true outermost provider in main-app.jsx so
 // it covers all app states (setup check / wizard / bootstrap), not just the
 // main studio return below. Do not re-wrap here — double-gating renders two
@@ -61,7 +74,14 @@ const LazyFallback = () => <div className="app-lazy-fallback">{i18n.t('app.loadi
 
 import { Toaster, toast } from 'react-hot-toast';
 import { toastErrorWithReport } from './utils/errorToast';
+import { listenDictationNotice, showDictationNotice } from './utils/dictationNotice';
 import { addBreadcrumb } from './utils/breadcrumbs';
+import { appShellClasses } from './utils/appShellClasses';
+import { configuredRemoteBackend, probeRemoteBackend } from './utils/remoteBackendProbe';
+import { applyUiScale } from './utils/uiScaleEngine';
+import { resolveUiScale, suggestUiScale } from './utils/uiScaleSuggestion';
+import { recordValueMoment } from './utils/donationMoments';
+import useResponsiveShellSize from './hooks/useResponsiveShellSize';
 import {
   POPULAR_LANGS,
   POPULAR_ISO,
@@ -71,7 +91,9 @@ import {
   CLONE_MAX_SECONDS,
 } from './utils/constants';
 import { LANG_CODES } from './utils/languages';
-import { API, apiFetch } from './api/client';
+import { restoreProjectExtras } from './utils/projectState';
+import { castSourcesFromJob } from './utils/segments';
+import { API, apiFetch, apiJson } from './api/client';
 import { flushMemory as apiFlushMemory } from './api/system';
 import {
   saveProject as apiSaveProject,
@@ -80,9 +102,16 @@ import {
   renameProject as apiRenameProject,
 } from './api/projects';
 import { exportAction, exportReveal, exportRecord } from './api/exports';
+import {
+  clearHistory as apiClearHistory,
+  setHistoryStarred as apiSetHistoryStarred,
+  audioUrlWithCacheBust,
+} from './api/generate';
+import { clearDubHistory as apiClearDubHistory, dubBurnQuery } from './api/dub';
 
 import { isTauri, doubleClickMaximize, fileToMediaUrl, playBlobAudio } from './utils/media';
 import { browserDownload } from './utils/download';
+import { downloadMedia } from './utils/mediaDownload';
 import { checkForUpdate, fetchAppVersion } from './utils/updater';
 import { syncChannel } from './utils/channelControl';
 import i18n from './i18n';
@@ -93,53 +122,67 @@ function App() {
   // polls every 1 s; until `ready`, we render BootstrapSplash instead of the
   // normal app shell, so the user sees real progress instead of a hung UI.
   const { stage: bootstrapStage, message: bootstrapMessage } = useBootstrapStage();
+  // Read once, like api/client.ts. Saving or disabling a remote backend reloads
+  // the app, so this value and API's module-level base always move together.
+  const [remoteBackend] = useState(() => configuredRemoteBackend());
 
   // UI navigation state now lives in the Zustand `uiSlice` (Phase 2.2).
   // Mode + uiScale + sidebar-collapsed persist across reloads automatically
   // via the store's `partialize`; active project / voice ids stay transient.
   const uiScale = useAppStore((s) => s.uiScale);
+  const uiScaleConfigured = useAppStore((s) => s.uiScaleConfigured);
+  const uiScalePreviewed = useAppStore((s) => s.uiScalePreviewed);
+  const setUiScale = useAppStore((s) => s.setUiScale);
+  const setUiScaleConfigured = useAppStore((s) => s.setUiScaleConfigured);
+  const setUiScalePreviewed = useAppStore((s) => s.setUiScalePreviewed);
+  const [storeHydrated, setStoreHydrated] = useState(
+    () => useAppStore.persist?.hasHydrated?.() ?? true,
+  );
 
-  // Responsive shell breakpoints driven off the app-container's OWN width, not
-  // the viewport. The shell is sized `width: calc(100vw / --ui-scale)` then
-  // `zoom: --ui-scale` (#504; the WebKitGTK no-op case is handled by the
-  // data-zoom-layout probe below), so the grid lays out against `100vw/scale` —
-  // which `el.clientWidth` reports. Viewport `@media` queries fire on raw
-  // `100vw` and so collapse at the wrong threshold whenever the UI scale ≠ 1,
-  // cramming the content into a sliver. ResizeObserver fires on both window
-  // resize and scale change (the calc width changes), so this stays correct.
-  const shellRef = useRef(null);
-  const [shellWidth, setShellWidth] = useState(Infinity);
   useEffect(() => {
-    const el = shellRef.current;
-    if (!el || typeof ResizeObserver === 'undefined') return undefined;
-    const ro = new ResizeObserver(() => setShellWidth(el.clientWidth));
-    ro.observe(el);
-    setShellWidth(el.clientWidth);
-    return () => ro.disconnect();
-  }, []);
+    if (storeHydrated) return undefined;
+    const unsubscribe = useAppStore.persist?.onFinishHydration?.(() => setStoreHydrated(true));
+    if (useAppStore.persist?.hasHydrated?.()) setStoreHydrated(true);
+    return unsubscribe;
+  }, [storeHydrated]);
 
-  // Engine capability probe (#523/#524): does this WebView honor `zoom` as a
-  // LAYOUT transform? Chromium (WebView2 / macOS WebKit) and modern WebKitGTK
-  // do; older WebKitGTK (Linux) treats it as a no-op. The .app-container sizing
-  // branches on the result (index.css) so the shell fills the window on BOTH —
-  // no black band on WebKitGTK, no clipped Generate/Settings CTAs on Chromium.
-  // Measuring a real zoomed element is robust where @supports(zoom)/UA-sniffing
-  // aren't (both report "supported" on WebKitGTK even when zoom doesn't lay out).
+  // Latched on first render — "startup" is the contract, not a per-render read.
+  // Tauri's native zoom keeps the CSS viewport equal to the visible window
+  // (utils/uiScaleEngine.js), so applying a scale changes `window.innerWidth`.
+  // Re-measuring here on every render made this value depend on the zoom it
+  // itself produces, which is the other half of the first-run oscillation
+  // fixed in UiScaleSetup.jsx — see the long comment there. A live read also
+  // can't be the "startup" suggestion by definition.
+  const [startupSuggestedScale] = useState(() =>
+    suggestUiScale({
+      width: typeof window === 'undefined' ? 1440 : window.innerWidth,
+      height: typeof window === 'undefined' ? 900 : window.innerHeight,
+    }),
+  );
+  const effectiveUiScale = resolveUiScale({
+    configured: uiScaleConfigured,
+    previewed: uiScalePreviewed,
+    selected: uiScale,
+    suggested: startupSuggestedScale,
+  });
+  const [uiScaleEngine, setUiScaleEngine] = useState(() =>
+    typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window ? 'native' : 'css',
+  );
+
+  // Desktop UI scale belongs at the webview boundary. A CSS `zoom` probe can
+  // report the expected bounding box on WebKitGTK even when the painted shell
+  // still occupies only the upper-left of the window. Tauri's native zoom keeps
+  // layout and paint in agreement; browser/dev sessions retain the CSS path.
   useLayoutEffect(() => {
-    let honored = true;
-    try {
-      const probe = document.createElement('div');
-      probe.style.cssText = 'position:absolute;left:-9999px;top:0;width:100px;height:100px;zoom:2';
-      document.body.appendChild(probe);
-      honored = Math.round(probe.getBoundingClientRect().width) >= 150;
-      probe.remove();
-    } catch {
-      honored = true;
-    } // safe default: the existing zoom path
-    document.documentElement.dataset.zoomLayout = honored ? 'on' : 'off';
-  }, []);
-  const shellSizeClass =
-    shellWidth <= 600 ? 'shell-mini' : shellWidth <= 1100 ? 'shell-narrow' : '';
+    let cancelled = false;
+    void applyUiScale(effectiveUiScale).then((engine) => {
+      if (!cancelled) setUiScaleEngine(engine);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveUiScale]);
+  const { observeShell, shellSizeClass } = useResponsiveShellSize(effectiveUiScale, uiScaleEngine);
   const theme = useAppStore((s) => s.theme);
 
   const locale = useAppStore((s) => s.locale);
@@ -174,6 +217,9 @@ function App() {
   useEffect(() => {
     addBreadcrumb(`view:${mode}`);
   }, [mode]);
+  // Navigation skin: the icon rail (default) or titlebar tabs (Settings →
+  // Appearance). Only one of the two renders at a time.
+  const navStyle = useAppStore((s) => s.navStyle);
   const [navRailSide, setNavRailSide] = useState(() => {
     try {
       return localStorage.getItem('omnivoice.navRailSide') || 'left';
@@ -215,6 +261,27 @@ function App() {
       if (unlisten) unlisten();
     };
   }, [setMode]);
+
+  // Dictation failures are raised in the widget window, which is never shown —
+  // this is the only place they can reach the user. Without it, a hotkey press
+  // that can't paste (Accessibility ungranted) or can't record (mic denied)
+  // would be indistinguishable from a hotkey that isn't working at all.
+  useEffect(() => {
+    let unlisten;
+    let cancelled = false;
+    (async () => {
+      const stop = await listenDictationNotice(showDictationNotice);
+      // The await above can outlive the effect (StrictMode double-mount, or a
+      // fast unmount) — drop the subscription rather than leaking a listener
+      // that would double every later toast.
+      if (cancelled) stop();
+      else unlisten = stop;
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
   const flipNavRailSide = useCallback(() => {
     setNavRailSide((prev) => {
       const next = prev === 'left' ? 'right' : 'left';
@@ -233,17 +300,18 @@ function App() {
     mode === 'settings' ||
     mode === 'voice' ||
     mode === 'donate' ||
-    mode === 'queue' ||
+    mode === 'batch' ||
     mode === 'tools' ||
     mode === 'projects' ||
     mode === 'gallery' ||
     mode === 'enterprise' ||
     mode === 'contact' ||
     mode === 'transcriptions' ||
+    mode === 'catalogue' ||
     mode === 'stories' ||
     mode === 'audiobook' ||
     // Voice (studio) and Dub workspaces moved their saved voices /
-    // projects + history into right-side panels; left sidebar dissolved.
+    // projects + history into workspace rails; global sidebar dissolved.
     mode === 'studio' ||
     mode === 'dub';
   const availableSidebarTabs = [];
@@ -321,6 +389,7 @@ function App() {
     handleLockProfile,
     handleUnlockProfile,
   } = useProfiles({ loadHistory, loadProfiles });
+  const clearSelectedProfile = useCallback(() => setSelectedProfile(null), [setSelectedProfile]);
 
   const {
     refAudio,
@@ -382,8 +451,20 @@ function App() {
   const [compareProgress, setCompareProgress] = useState('');
 
   // ═══ MIC RECORDING ═══
-  const { isRecording, isCleaning, recordingTime, startRecording, stopRecording } =
-    useRecording(ingestRefAudio);
+  const {
+    isRecording,
+    isStartingRecording,
+    isCleaning,
+    recordingTime,
+    audioInputs,
+    selectedAudioInputId,
+    setSelectedAudioInputId,
+    channelMode,
+    setChannelMode,
+    inputLevelStore,
+    startRecording,
+    stopRecording,
+  } = useRecording(ingestRefAudio);
 
   // ═══ DUB STATE ═══
   const dubJobId = useAppStore((s) => s.dubJobId);
@@ -396,6 +477,8 @@ function App() {
   const setDubLang = useAppStore((s) => s.setDubLang);
   const dubLangCode = useAppStore((s) => s.dubLangCode);
   const setDubLangCode = useAppStore((s) => s.setDubLangCode);
+  const dubSourceLangCode = useAppStore((s) => s.dubSourceLangCode);
+  const setDubSourceLangCode = useAppStore((s) => s.setDubSourceLangCode);
   const dubDialect = useAppStore((s) => s.dubDialect);
   const setDubDialect = useAppStore((s) => s.setDubDialect);
   const dubInstruct = useAppStore((s) => s.dubInstruct);
@@ -415,13 +498,20 @@ function App() {
   const defaultTrack = useAppStore((s) => s.defaultTrack);
   const setDefaultTrack = useAppStore((s) => s.setDefaultTrack);
   const exportTracks = useAppStore((s) => s.exportTracks);
+  const setExportTracks = useAppStore((s) => s.setExportTracks);
   const previewSegIds = useAppStore((s) => s.previewSegIds);
   const speakerClones = useAppStore((s) => s.speakerClones);
   const setSpeakerClones = useAppStore((s) => s.setSpeakerClones);
+  // Multi-language batch picks (P1.4) — saved with the project payload.
+  const multiLangMode = useAppStore((s) => s.multiLangMode);
+  const setMultiLangMode = useAppStore((s) => s.setMultiLangMode);
+  const multiLangs = useAppStore((s) => s.multiLangs);
+  const setMultiLangs = useAppStore((s) => s.setMultiLangs);
 
   const setGlossaryTerms = useAppStore((s) => s.setGlossaryTerms);
   const dualSubs = useAppStore((s) => s.dualSubs);
   const burnSubs = useAppStore((s) => s.burnSubs);
+  const karaokeSubs = useAppStore((s) => s.karaokeSubs);
 
   // ── UNDO / REDO + SEGMENT EDITING ──
   // Must come before useDubWorkflow because the dub generate handler needs
@@ -433,8 +523,10 @@ function App() {
     segmentEditField,
     segmentDelete,
     segmentRestoreOriginal,
+    pasteTranslations,
     segmentSplit,
     segmentMerge,
+    segmentInsert,
     segmentMoveResize,
     timelineSelSegId,
     setTimelineSelSegId,
@@ -449,6 +541,8 @@ function App() {
     closeDirection,
     saveDirection,
     setLastGenFingerprints,
+    fingerprintsByLang,
+    setFingerprintsByLang,
     incrementalPlan,
     recomputeIncremental,
   } = useSegmentEditing();
@@ -464,16 +558,24 @@ function App() {
     setShowTranscript,
     setPreviewAudios,
     transcribeElapsed,
+    transcribeProgress,
+    asrInstall,
     handleDubUpload: _handleDubUpload,
     handleDubIngestUrl,
     handleDubAbort,
     handleDubRetryTranscribe,
+    handleInstallMissingAsr,
     handleDubStop,
     handleDubGenerate,
     handleCleanupSegments,
     handleTranslateAll,
     handleDubImportSrt,
-  } = useDubWorkflow({ loadProjects, loadProfiles, loadDubHistory, setLastGenFingerprints });
+  } = useDubWorkflow({
+    loadProjects,
+    loadProfiles,
+    loadDubHistory,
+    setLastGenFingerprints,
+  });
 
   const [dubVideoFile, setDubVideoFile] = useState(null);
   const [dubLocalBlobUrl, setDubLocalBlobUrl] = useState(null);
@@ -499,6 +601,7 @@ function App() {
   const setActiveProject = useAppStore((s) => s.setActiveProject);
   const sidebarTab = useAppStore((s) => s.sidebarTab);
   const setSidebarTab = useAppStore((s) => s.setSidebarTab);
+  const openSettingsTab = useAppStore((s) => s.openSettingsTab);
 
   // Snap sidebar to a valid tab when view changes
   useEffect(() => {
@@ -523,16 +626,42 @@ function App() {
   // the studio in front of a user who actually needs the wizard.
   const [setupNeeded, setSetupNeeded] = useState(false);
   const [setupChecked, setSetupChecked] = useState(false);
+  const [remoteFailure, setRemoteFailure] = useState(null);
+  const [remoteProbeAttempt, setRemoteProbeAttempt] = useState(0);
+  const retryRemoteBackend = useCallback(() => {
+    setRemoteFailure(null);
+    setSetupChecked(false);
+    setRemoteProbeAttempt((attempt) => attempt + 1);
+  }, []);
+  const openRemoteBackendSettings = useCallback(() => {
+    setRemoteFailure(null);
+    openSettingsTab('sharing');
+  }, [openSettingsTab]);
+  const backendReady = remoteBackend ? setupChecked && !remoteFailure : bootstrapStage === 'ready';
+
+  // Analytics remains off until the selected backend has passed its startup
+  // gate. Starting this request on mount leaked connection/CORS noise from a
+  // stale remote URL before the recovery screen could explain or repair it.
   useEffect(() => {
-    // Gate the probe on the bootstrap being 'ready' — before that there is
-    // no backend to answer. Probing from mount burned the 30-attempt ceiling
-    // during the setup/installing acts (minutes long on a first run), so the
-    // wizard was silently skipped straight into the studio once the install
-    // finished. Keyed on bootstrapStage: the probe (re)runs the moment the
-    // backend becomes reachable.
-    if (bootstrapStage !== 'ready') return undefined;
+    if (!backendReady) return;
+    void initAnalyticsFromConsent(() => apiJson('/api/settings/analytics'));
+  }, [backendReady]);
+
+  useEffect(() => {
+    // A local backend cannot answer before Rust reports ready. A configured
+    // remote is independent of the local bootstrap and must be probed at once;
+    // otherwise a first-run shell parks at awaiting_setup forever.
+    if (!remoteBackend && bootstrapStage !== 'ready') return undefined;
     let cancelled = false;
     (async () => {
+      if (remoteBackend) {
+        const result = await probeRemoteBackend(remoteBackend.url);
+        if (cancelled) return;
+        setRemoteFailure(result.ok ? null : result);
+        setSetupNeeded(false);
+        setSetupChecked(true);
+        return;
+      }
       const { setupStatus } = await import('./api/setup');
       // ~30 attempts × ~1s ≈ 30s ceiling; enough for a cold sidecar on slow disks.
       for (let attempt = 0; attempt < 30 && !cancelled; attempt++) {
@@ -551,7 +680,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [bootstrapStage]);
+  }, [bootstrapStage, remoteBackend, remoteProbeAttempt]);
 
   // ── First sound ──
   // Onboarding should end with the product doing the thing: the moment the
@@ -559,7 +688,7 @@ function App() {
   // it. Best-effort by design — a first impression must never surface an
   // error, so every failure path is silent.
   useEffect(() => {
-    if (!setupChecked || setupNeeded || bootstrapStage !== 'ready') return;
+    if (!setupChecked || setupNeeded || !backendReady) return;
     let pending = false;
     try {
       pending = sessionStorage.getItem('omnivoice.firstSound') === '1';
@@ -576,15 +705,18 @@ function App() {
         // voice warm without depending on seeded profiles.
         fd.append('instruct', 'A warm, friendly narrator voice, medium pace');
         fd.append('num_step', '16');
-        const res = await apiFetch(`${API}/generate`, { method: 'POST', body: fd });
+        const res = await apiFetch(`${API}/generate`, {
+          method: 'POST',
+          body: fd,
+        });
         const blob = await res.blob();
-        await playBlobAudio(blob);
+        await playBlobAudio(blob, { label: i18n.t('player.generated_audio') });
         toast.success(i18n.t('firstrun.first_sound_done'), { duration: 7000 });
       } catch {
         /* silent — see above */
       }
     })();
-  }, [setupChecked, setupNeeded, bootstrapStage]);
+  }, [setupChecked, setupNeeded, backendReady]);
 
   // ── Tauri auto-updater ──
   // On boot, ask GitHub Releases if a newer build is available. If yes,
@@ -670,6 +802,22 @@ function App() {
   // ── KEYBOARD SHORTCUTS ──
   useEffect(() => {
     const handler = (e) => {
+      // In-webview navigation only: using DOM keydown keeps this identical in
+      // browser, macOS, Windows and Linux builds (unlike OS-level hotkeys).
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey) {
+        const key = e.key.toLowerCase();
+        if (key === 'e') {
+          e.preventDefault();
+          window.dispatchEvent(new Event('engine-quick-switch'));
+          return;
+        }
+        const index = Number(key);
+        if (index >= 1 && index <= NAV_ITEMS.length) {
+          e.preventDefault();
+          setMode(NAV_ITEMS[index - 1].id);
+          return;
+        }
+      }
       // ⌘+Enter or Ctrl+Enter → Generate
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
         e.preventDefault();
@@ -718,6 +866,7 @@ function App() {
       try {
         const finalName = await browserDownload(`${API}/audio/${sourceIdentifier}`, niceName);
         toast.success(i18n.t('app.toast_downloaded', { name: finalName }));
+        recordValueMoment('export'); // success-only donation moment
         try {
           await exportRecord({
             filename: finalName,
@@ -738,16 +887,20 @@ function App() {
       return;
     }
     try {
-      const { save } = await import('@tauri-apps/plugin-dialog');
-      const ext = fallbackName.includes('.') ? fallbackName.split('.').pop() : 'wav';
-      const destPath = await save({
-        defaultPath: fallbackName,
-        filters: [{ name: 'Media', extensions: [ext] }],
+      const { invoke } = await import('@tauri-apps/api/core');
+      const selection = await invoke('authorize_host_path', {
+        kind: 'dub_export',
+        suggestedName: fallbackName,
       });
-      if (!destPath) return; // User cancelled
+      if (!selection) return; // User cancelled
 
-      await exportAction({ source_filename: sourceIdentifier, destination_path: destPath, mode });
+      await exportAction({
+        source_filename: sourceIdentifier,
+        authorization: selection.authorization,
+        mode,
+      });
       toast.success(i18n.t('app.toast_exported', { name: fallbackName }));
+      recordValueMoment('export'); // success-only donation moment
       loadExportHistory();
     } catch (err) {
       console.error(err);
@@ -764,103 +917,16 @@ function App() {
       toast.error(i18n.t('app.toast_open_folder_failed', { message: err.message }));
     }
   };
-  const triggerDownload = async (url, fallbackName) => {
-    const extGuess = (
-      fallbackName.includes('.') ? fallbackName.split('.').pop() : 'bin'
-    ).toLowerCase();
-    const modeGuess = ['mp4', 'mov', 'mkv', 'webm'].includes(extGuess)
-      ? 'video'
-      : ['wav', 'mp3', 'flac'].includes(extGuess)
-        ? 'audio'
-        : 'file';
-
-    // In Tauri, WebKit silently drops blob downloads. Use native save dialog
-    // + server-side copy so the file actually lands on disk at a known path.
-    if (isTauri) {
-      try {
-        const { save } = await import('@tauri-apps/plugin-dialog');
-        const destPath = await save({
-          defaultPath: fallbackName,
-          filters: [{ name: modeGuess === 'video' ? 'Video' : 'Audio', extensions: [extGuess] }],
-        });
-        if (!destPath) return; // user cancelled
-        toast.loading(i18n.t('app.toast_saving', { name: fallbackName }), { id: fallbackName });
-
-        // Subtitles are small text bodies: fetch them raw and write from this
-        // (trusted) process via the save_text_file command — the user's dialog
-        // pick is the write authorization, and the backend never handles a
-        // destination path (#309).
-        if (['srt', 'vtt'].includes(extGuess)) {
-          const res = await apiFetch(url);
-          const text = await res.text();
-          const { invoke } = await import('@tauri-apps/api/core');
-          await invoke('save_text_file', { path: destPath, contents: text });
-          toast.success(i18n.t('app.toast_saved', { path: destPath }), { id: fallbackName });
-          try {
-            await exportRecord({
-              filename: fallbackName,
-              destination_path: destPath,
-              mode: modeGuess,
-            });
-            loadExportHistory();
-          } catch (err) {
-            console.warn('exportRecord (subtitle save) failed:', err);
-          }
-          return;
-        }
-
-        const sep = url.includes('?') ? '&' : '?';
-        const res = await apiFetch(`${url}${sep}save_path=${encodeURIComponent(destPath)}`);
-        // Every save_path-aware endpoint returns a JSON envelope. Guard the
-        // content-type so a raw-body response surfaces as a clear error
-        // instead of a cryptic JSON.parse failure (#309).
-        const ctype = res.headers.get('content-type') || '';
-        if (!ctype.includes('application/json')) {
-          throw new Error(
-            `Server returned ${ctype || 'an unknown content type'} instead of a JSON save confirmation`,
-          );
-        }
-        const data = await res.json();
-        toast.success(i18n.t('app.toast_saved', { path: data.path }), { id: fallbackName });
-        try {
-          await exportRecord({
-            filename: data.display_name || fallbackName,
-            destination_path: data.path,
-            mode: modeGuess,
-          });
-          loadExportHistory();
-        } catch (err) {
-          console.warn('exportRecord (Tauri save path) failed:', err);
-        }
-      } catch (err) {
-        console.error(err);
-        toast.error(i18n.t('app.toast_save_error', { message: err.message }), { id: fallbackName });
-      }
-      return;
-    }
-
-    // Browser path: standard blob download.
-    try {
-      toast.loading(i18n.t('app.toast_processing', { name: fallbackName }), { id: fallbackName });
-      const finalName = await browserDownload(url, fallbackName);
-      toast.success(i18n.t('app.toast_downloaded', { name: finalName }), { id: fallbackName });
-      try {
-        await exportRecord({
-          filename: finalName,
-          destination_path: `~/Downloads/${finalName}`,
-          mode: modeGuess,
-        });
-        loadExportHistory();
-      } catch (err) {
-        console.warn('exportRecord (browser download path) failed:', err);
-      }
-    } catch (err) {
-      console.error(err);
-      toast.error(i18n.t('app.toast_download_error', { message: err.message }), {
-        id: fallbackName,
-      });
-    }
-  };
+  // Save a dynamic export — dub video/audio/subtitles — to
+  // disk. The parity-safe dialog + server-side copy vs browser-blob branch now
+  // lives in the shared `downloadMedia` util (#1218) so audiobook/story exports
+  // reuse the exact same path and never fall back to a webview-hijacking
+  // `<a href download>`. App-specific niceties are passed as callbacks.
+  const triggerDownload = (url, fallbackName) =>
+    downloadMedia(url, fallbackName, {
+      onValueMoment: () => recordValueMoment('export'), // success-only donation
+      onHistoryChanged: loadExportHistory,
+    });
   // Pre-flight for audio/video exports. If any segments are at preview
   // quality (num_step=8, from a "Regen changed" click), re-render those at
   // full quality first so the user's exported file isn't carrying preview
@@ -879,9 +945,10 @@ function App() {
       if (exportTracks[t] !== false) selected.push(t);
     });
     const tracksParam = selected.join(',');
-    const burnParam = burnSubs ? `&burn_subs=1&dual=${dualSubs ? 1 : 0}` : '';
+    const burnParam = dubBurnQuery(burnSubs, dualSubs, karaokeSubs);
+    const resolvedDefaultTrack = resolveDubDefaultTrack(defaultTrack, dubLangCode, dubTracks);
     triggerDownload(
-      `${API}/dub/download/${dubJobId}/dubbed_video.mp4?preserve_bg=${preserveBg}&default_track=${defaultTrack}&include_tracks=${encodeURIComponent(tracksParam)}${burnParam}`,
+      `${API}/dub/download/${dubJobId}/dubbed_video.mp4?preserve_bg=${preserveBg}&default_track=${resolvedDefaultTrack}&include_tracks=${encodeURIComponent(tracksParam)}${burnParam}`,
       'dubbed_video.mp4',
     );
   };
@@ -909,6 +976,7 @@ function App() {
     setDubTracks([]);
     setDubProgress({ current: 0, total: 0, text: '' });
     setDubTranscript('');
+    setDubSourceLangCode('auto');
     setShowTranscript(false);
     setPreviewAudios({});
     setDubLocalBlobUrl((prev) => {
@@ -938,6 +1006,7 @@ function App() {
         dubSegments,
         dubLang,
         dubLangCode,
+        dubSourceLangCode,
         dubDialect,
         dubInstruct,
         dubTracks,
@@ -946,6 +1015,17 @@ function App() {
         preserveBg,
         defaultTrack,
         speakerClones,
+        // P1.4 — multi-language batch setup + export-track prefs travel with
+        // the project. Additive: loaders default them when absent (see
+        // utils/projectState.js).
+        multiLangMode,
+        multiLangs,
+        exportTracks,
+        // P1.3 — per-language segment fingerprints, so reopening a project
+        // keeps every track's "Regen N changed" plan. Additive: legacy
+        // loaders ignore the key; segments' `translations` maps ride along
+        // inside dubSegments above.
+        segHashesByLang: fingerprintsByLang,
       },
     };
     try {
@@ -978,18 +1058,34 @@ function App() {
       );
       setDubLang(s.dubLang || 'Auto');
       setDubLangCode(s.dubLangCode || 'en');
+      setDubSourceLangCode(s.dubSourceLangCode || 'auto');
       setDubDialect(s.dubDialect || '');
       setDubInstruct(s.dubInstruct || '');
       setDubTracks(s.dubTracks || []);
       setDubTranscript(s.dubTranscript || '');
       setPreserveBg(s.preserveBg !== undefined ? s.preserveBg : true);
-      setDefaultTrack(s.defaultTrack !== undefined ? s.defaultTrack : 'original');
+      setDefaultTrack(s.defaultTrack !== undefined ? s.defaultTrack : '');
       setDubStep(s.dubStep === 'done' ? 'done' : s.dubSegments?.length ? 'editing' : 'idle');
       // Phase 4.5 — rehydrate per-segment fingerprints. The incremental plan
       // immediately shows "N segments changed" for any segments edited after
-      // the last generate.
-      setLastGenFingerprints(s.segHashes || {});
+      // the last generate. P1.3: prefer the per-language map; a legacy flat
+      // `segHashes` can only describe the project's saved target language.
+      if (
+        s.segHashesByLang &&
+        typeof s.segHashesByLang === 'object' &&
+        !Array.isArray(s.segHashesByLang)
+      ) {
+        setFingerprintsByLang(s.segHashesByLang);
+      } else {
+        setLastGenFingerprints(s.segHashes || {}, s.dubLangCode || 'en');
+      }
       setSpeakerClones(s.speakerClones || {});
+      // P1.4 — restore multi-lang picks; legacy payloads default to off/empty
+      // and leave the in-session exportTracks untouched (null sentinel).
+      const extras = restoreProjectExtras(s);
+      setMultiLangMode(extras.multiLangMode);
+      setMultiLangs(extras.multiLangs);
+      if (extras.exportTracks) setExportTracks(extras.exportTracks);
       toast.success(i18n.t('app.toast_opened', { name: data.name }));
     } catch (err) {
       toast.error(err.message);
@@ -1039,19 +1135,35 @@ function App() {
         })),
       );
       setDubTranscript(job.full_transcript || '');
-      setDubLang(item.language || 'Auto');
-      setDubLangCode(item.language_code || 'und');
+      // Older DBs froze the language/language_code COLUMNS at the ingest-time
+      // "" (the UPSERT didn't update them until #P0 fixed it), but the job_data
+      // JSON always carried the value generation set. Falling back to job_data
+      // restores existing rows correctly without a migration.
+      setDubLang(item.language || job.language || 'Auto');
+      setDubLangCode(item.language_code || job.language_code || 'und');
+      setDubSourceLangCode(job.source_lang_override || job.source_lang || 'auto');
       setDubTracks(Object.keys(job.dubbed_tracks || {}));
       setDubStep(Object.keys(job.dubbed_tracks || {}).length > 0 ? 'done' : 'editing');
       // Phase 4.5 — seg_hashes are written per successful segment by
       // dub_generate.py. Reloading a half-generated dub lets the "Regen N
-      // changed" button resume right where the crash happened.
-      setLastGenFingerprints(job.seg_hashes || {});
-      // Rehydrate the auto-extracted speaker clones so the CAST dropdown's
-      // "🎤 From video" option reappears after a reload. Projects that
-      // predate the speaker-clone feature have an empty map; the Extract
-      // Voices button in the CAST strip handles those.
-      setSpeakerClones(job.speaker_clones || {});
+      // changed" button resume right where the crash happened. P1.3: prefer
+      // the per-language map (multi-track jobs); a legacy flat map belongs to
+      // the job's last-generated language — the code restored just above.
+      if (
+        job.seg_hashes_by_lang &&
+        typeof job.seg_hashes_by_lang === 'object' &&
+        !Array.isArray(job.seg_hashes_by_lang)
+      ) {
+        setFingerprintsByLang(job.seg_hashes_by_lang);
+      } else {
+        setLastGenFingerprints(
+          job.seg_hashes || {},
+          item.language_code || job.language_code || 'und',
+        );
+      }
+      // Rehydrate path-free cast sources. Legacy heuristic jobs may have only
+      // per-segment references; castSourcesFromJob recovers those too.
+      setSpeakerClones(castSourcesFromJob(job));
     } catch (e) {
       console.error('Failed to restore job_data', e);
     }
@@ -1076,8 +1188,35 @@ function App() {
     toast.success(i18n.t('app.toast_restored_state'));
   };
 
+  // Generation takes: star/unstar a take so it survives the retention cap and
+  // never ages off the rail. Optimistic errors only — the WS
+  // generation_history event refreshes the list on success.
+  const toggleStarHistory = async (item) => {
+    try {
+      await apiSetHistoryStarred(item.id, !item.starred);
+      loadHistory();
+    } catch (err) {
+      toast.error(err.message);
+    }
+  };
+
+  // Load a past take back as the active output: fetch its WAV and hand it to
+  // the same global mini-player a fresh generation plays through.
+  const playTakeAsOutput = async (item) => {
+    try {
+      const res = await apiFetch(audioUrlWithCacheBust(item.audio_path));
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      await playBlobAudio(blob, {
+        label: item.text || i18n.t('player.generated_audio'),
+      });
+    } catch (err) {
+      toast.error(i18n.t('history.load_take_failed', { message: err.message || '' }));
+    }
+  };
+
   const deleteHistory = async (id, type) => {
-    if (!(await askConfirm('Delete this history item?'))) return;
+    if (!(await askConfirm(i18n.t('history.delete_confirm')))) return;
     try {
       const endpoint = type === 'dub' ? `${API}/dub/history/${id}` : `${API}/history/${id}`;
       await apiFetch(endpoint, { method: 'DELETE' });
@@ -1092,13 +1231,34 @@ function App() {
     }
   };
 
+  // Clear-all for the workspace history panels (#1032). The control lived in
+  // the old left Sidebar; the workspace UX overhaul (#374) moved history into
+  // the right-side WorkspaceHistory panels and the button was dropped in the
+  // move — restore it, scoped per workspace (voice = synth rows, dub = dubs).
+  const clearWorkspaceHistory = async (type) => {
+    const count = type === 'dub' ? dubHistory.length : history.length;
+    if (!(await askConfirm(i18n.t('sidebar.clear_confirm', { count })))) return;
+    try {
+      if (type === 'dub') {
+        await apiClearDubHistory();
+        loadDubHistory();
+      } else {
+        await apiClearHistory();
+        loadHistory();
+      }
+      toast.success(i18n.t('sidebar.history_cleared'));
+    } catch (err) {
+      toast.error(err.message);
+    }
+  };
+
   // Install-plan screen outranks everything — both on a true first run and
   // when explicitly requested via `--setup`. Without this, a live backend
   // answering /setup/status would route straight to the model wizard and the
   // awaiting_setup stage would never get to render.
-  if (bootstrapStage === 'awaiting_setup') {
+  if (!remoteBackend && bootstrapStage === 'awaiting_setup') {
     return (
-      <div style={{ zoom: uiScale }}>
+      <div className="app-bootstrap-scale" style={{ '--ui-scale': effectiveUiScale }}>
         <BootstrapSplash stage={bootstrapStage} message={bootstrapMessage} />
       </div>
     );
@@ -1109,31 +1269,61 @@ function App() {
   // Also blocks render until we've heard back from the backend at least once
   // — the frozen sidecar's cold-start import is ~5-10 s and without this we
   // flash the empty studio before the wizard has a chance to mount.
-  if (!setupChecked) {
+  if (!setupChecked || !storeHydrated) {
     return (
-      <div style={{ zoom: uiScale }}>
+      <div className="app-bootstrap-scale" style={{ '--ui-scale': effectiveUiScale }}>
         <BootstrapSplash stage={bootstrapStage} message={bootstrapMessage} />
-        <Suspense fallback={null}>
-          <LogsFooter />
+      </div>
+    );
+  }
+  if (remoteFailure) {
+    return (
+      <div className="app-bootstrap-scale" style={{ '--ui-scale': effectiveUiScale }}>
+        <RemoteBackendRecovery
+          failure={remoteFailure}
+          onRetry={retryRemoteBackend}
+          onOpenSettings={openRemoteBackendSettings}
+        />
+      </div>
+    );
+  }
+  if (!uiScaleConfigured && backendReady) {
+    return (
+      <div className="app-wizard-wrap" style={{ '--ui-scale': effectiveUiScale }}>
+        <div data-tauri-drag-region className="app-wizard-dragstrip" />
+        <Suspense fallback={<LazyFallback />}>
+          <UiScaleSetup
+            uiScale={uiScale}
+            setUiScale={setUiScale}
+            setUiScaleConfigured={setUiScaleConfigured}
+            setUiScalePreviewed={setUiScalePreviewed}
+          />
         </Suspense>
       </div>
     );
   }
-  if (setupNeeded && bootstrapStage === 'ready') {
+  if (setupNeeded && backendReady) {
     // Render outside the `app-container` grid so the wizard spans the full
     // viewport instead of getting squeezed into whatever grid cell the
     // studio layout reserves for the main content column. Gated on the
     // bootstrap being 'ready': while the stage is still settling (checking /
     // awaiting_setup racing the first poll), the wizard must not steal the
     // mount from the install-plan screen.
+    // `--ui-scale`, NOT a bare inline `zoom`: the CSS shrinks the box by the
+    // scale and zooms it back (#504 contract, same as .app-container). An
+    // inline zoom on top of a full-viewport box pushed the pinned
+    // Continue/HF-token row below the window at any scale > 1.
     return (
-      <div className="app-wizard-wrap" style={{ zoom: uiScale }}>
+      <div className="app-wizard-wrap" style={{ '--ui-scale': effectiveUiScale }}>
         {/* Invisible drag strip across the top 28 px of the wizard —
             matches the macOS traffic-light zone so the window can be
             dragged / double-click-zoomed from anywhere along the top. */}
         {/* Double-click-to-maximize is handled globally in main.jsx for every
             drag region (splash, first-run, wizard, main) on all platforms. */}
         <div data-tauri-drag-region className="app-wizard-dragstrip" />
+        {/* The wizard is where the multi-GB downloads happen — a mid-download
+            backend restart needs its banner here too, not only in the studio. */}
+        <BackendRestartBanner />
         <Suspense fallback={<LazyFallback />}>
           <SetupWizard
             onReady={() => {
@@ -1149,32 +1339,31 @@ function App() {
             }}
           />
         </Suspense>
-        <Suspense fallback={null}>
-          <LogsFooter />
-        </Suspense>
       </div>
     );
   }
 
   // Block the main UI until Rust reports the backend is ready. In dev web
   // (no Tauri), the hook returns 'ready' immediately so this is a no-op.
-  if (bootstrapStage !== 'ready') {
-    return <BootstrapSplash stage={bootstrapStage} message={bootstrapMessage} />;
+  if (!backendReady) {
+    return (
+      <div className="app-bootstrap-scale" style={{ '--ui-scale': effectiveUiScale }}>
+        <BootstrapSplash stage={bootstrapStage} message={bootstrapMessage} />
+      </div>
+    );
   }
 
   return (
     <div
-      ref={shellRef}
-      className={[
-        'app-container',
-        isSidebarCollapsed ? 'sidebar-collapsed' : '',
-        hideSidebar ? 'sidebar-hidden' : '',
-        navRailSide === 'right' ? 'rail-right' : '',
+      ref={observeShell}
+      className={appShellClasses({
+        navStyle,
+        navRailSide,
+        isSidebarCollapsed,
+        hideSidebar,
         shellSizeClass,
-      ]
-        .filter(Boolean)
-        .join(' ')}
-      style={{ '--ui-scale': uiScale }}
+      })}
+      style={{ '--ui-scale': effectiveUiScale }}
     >
       {pendingTrimFile && (
         <ErrorBoundary name="audio-trimmer">
@@ -1211,9 +1400,34 @@ function App() {
 
       <FloatingPill />
 
+      {/* #941: honest surfacing of backend process crashes (exit code +
+          stderr tail from the shell's crash marker), with ack-on-view. */}
+      <BackendCrashNotice />
+
+      {/* #1177: the shell's `Failed { message }` diagnosis for a backend that
+          could not START, surfaced after the splash is gone — the case that
+          used to collapse into the evidence-free "can't reach the backend". */}
+      <BackendStartFailureNotice />
+
+      {/* One-time analytics consent ask for installs that predate the
+          first-run consent step. Renders nothing once any choice was made.
+          Source builds get it too since #1193 (in-repo default token). */}
+      <AnalyticsConsentBanner />
+
+      {/* First-run-only offer to switch the UI to English (#1215). Shows only
+          when the auto-detected language isn't English AND the user hasn't
+          chosen a language — renders nothing otherwise. UI convenience only. */}
+      <LanguageSwitchPrompt />
+
+      {/* #567's visible half: while the shell auto-restarts a dead backend
+          (10–20 s), say so once — instead of every request surfacing its own
+          "Can't reach the backend" toast. */}
+      <BackendRestartBanner />
+
       <Header
         mode={mode}
         setMode={setMode}
+        navStyle={navStyle}
         modelStatus={modelStatus}
         doubleClickMaximize={doubleClickMaximize}
         activeProjectName={activeProjectName}
@@ -1233,9 +1447,11 @@ function App() {
         }}
       />
 
-      <NavRail mode={mode} setMode={setMode} side={navRailSide} onFlipSide={flipNavRailSide} />
+      {navStyle === 'tabs' ? null : (
+        <NavRail mode={mode} setMode={setMode} side={navRailSide} onFlipSide={flipNavRailSide} />
+      )}
 
-      <div className="main-content">
+      <ModeLifecycleBoundary mode={mode}>
         {/* ═══ LAUNCHPAD TAB ═══ */}
         {mode === 'settings' ? (
           <ErrorBoundary name="settings">
@@ -1259,7 +1475,7 @@ function App() {
               />
             </Suspense>
           </ErrorBoundary>
-        ) : mode === 'queue' ? (
+        ) : mode === 'batch' ? (
           <ErrorBoundary name="batch-queue">
             <Suspense fallback={<LazyFallback />}>
               <BatchQueue onBack={() => setMode('launchpad')} />
@@ -1300,13 +1516,19 @@ function App() {
         ) : mode === 'gallery' ? (
           <ErrorBoundary name="gallery">
             <Suspense fallback={<LazyFallback />}>
-              <VoiceGallery />
+              <VoiceGallery clearSelectedProfile={clearSelectedProfile} />
             </Suspense>
           </ErrorBoundary>
         ) : mode === 'transcriptions' ? (
           <ErrorBoundary name="transcriptions">
             <Suspense fallback={<LazyFallback />}>
               <TranscriptionsPage />
+            </Suspense>
+          </ErrorBoundary>
+        ) : mode === 'catalogue' ? (
+          <ErrorBoundary name="catalogue">
+            <Suspense fallback={<LazyFallback />}>
+              <ModelCataloguePage />
             </Suspense>
           </ErrorBoundary>
         ) : mode === 'stories' ? (
@@ -1336,7 +1558,9 @@ function App() {
         ) : mode === 'contact' ? (
           <ErrorBoundary name="contact">
             <Suspense fallback={<LazyFallback />}>
-              <ContactPage onBack={() => setMode('launchpad')} />
+              {/* Same page as donate / enterprise — it scrolls to the contact
+                  section. Three routes, one destination. */}
+              <SupportPage initialView="contact" onBack={() => setMode('launchpad')} />
             </Suspense>
           </ErrorBoundary>
         ) : mode === 'launchpad' ? (
@@ -1358,6 +1582,19 @@ function App() {
           <div
             className={`studio-with-history ${dubStep === 'idle' ? '' : 'studio-with-history--editing'}`}
           >
+            {dubStep === 'idle' && (
+              <div className="studio-projects">
+                <WorkspaceProjects
+                  projects={studioProjects}
+                  activeProjectId={activeProjectId}
+                  canSave={false}
+                  saveProject={saveProject}
+                  loadProject={loadProject}
+                  deleteProject={deleteProject}
+                  renameProject={renameProject}
+                />
+              </div>
+            )}
             <div className="studio-with-history__main">
               <ErrorBoundary name="dub">
                 <Suspense fallback={<LazyFallback />}>
@@ -1367,6 +1604,8 @@ function App() {
                     dubVideoFile={dubVideoFile}
                     dubLocalBlobUrl={dubLocalBlobUrl}
                     transcribeElapsed={transcribeElapsed}
+                    transcribeProgress={transcribeProgress}
+                    asrInstall={asrInstall}
                     translateProvider={translateProvider}
                     setTranslateProvider={setTranslateProvider}
                     onGlossaryChange={setGlossaryTerms}
@@ -1382,6 +1621,7 @@ function App() {
                     handleDubUpload={handleDubUpload}
                     handleDubIngestUrl={handleDubIngestUrl}
                     handleDubRetryTranscribe={handleDubRetryTranscribe}
+                    handleInstallMissingAsr={handleInstallMissingAsr}
                     handleDubStop={handleDubStop}
                     handleDubGenerate={handleDubGenerate}
                     handleDubDownload={handleDubDownload}
@@ -1402,8 +1642,10 @@ function App() {
                     segmentEditField={segmentEditField}
                     segmentDelete={segmentDelete}
                     segmentRestoreOriginal={segmentRestoreOriginal}
+                    pasteTranslations={pasteTranslations}
                     segmentSplit={segmentSplit}
                     segmentMerge={segmentMerge}
+                    segmentInsert={segmentInsert}
                     segmentMoveResize={segmentMoveResize}
                     timelineSelSegId={timelineSelSegId}
                     setTimelineSelSegId={setTimelineSelSegId}
@@ -1421,26 +1663,37 @@ function App() {
               editor (dubStep !== 'idle'). */}
             {dubStep === 'idle' && (
               <div className="studio-right">
-                <WorkspaceProjects
-                  projects={studioProjects}
-                  activeProjectId={activeProjectId}
-                  canSave={dubStep !== 'idle' || !!dubVideoFile}
-                  saveProject={saveProject}
-                  loadProject={loadProject}
-                  deleteProject={deleteProject}
-                  renameProject={renameProject}
-                />
                 <WorkspaceHistory
                   variant="dub"
                   dubHistory={dubHistory}
                   restoreDubHistory={restoreDubHistory}
                   deleteHistory={deleteHistory}
+                  clearHistory={() => clearWorkspaceHistory('dub')}
                 />
               </div>
             )}
           </div>
         ) : (
           <div className="studio-with-history">
+            <div className="studio-voices">
+              <WorkspaceVoices
+                defineMethod={defineMethod}
+                profiles={profiles}
+                selectedProfile={selectedProfile}
+                setSelectedProfile={setSelectedProfile}
+                previewLoading={previewLoading}
+                handleSelectProfile={handleSelectProfile}
+                handleDeleteProfile={handleDeleteProfile}
+                handlePreviewVoice={handlePreviewVoice}
+                handleUnlockProfile={handleUnlockProfile}
+                openVoiceProfile={openVoiceProfile}
+                selectionDisabled={isStartingRecording || isRecording}
+                onOpenVoicePreview={(profileId) => {
+                  setVoicePreviewProfileId(profileId || '');
+                  setIsVoicePreviewOpen(true);
+                }}
+              />
+            </div>
             <div className="studio-with-history__main">
               <ErrorBoundary name="clone-design">
                 <Suspense fallback={<LazyFallback />}>
@@ -1487,8 +1740,15 @@ function App() {
                     showSaveProfile={showSaveProfile}
                     setShowSaveProfile={setShowSaveProfile}
                     isRecording={isRecording}
+                    isStartingRecording={isStartingRecording}
                     isCleaning={isCleaning}
                     recordingTime={recordingTime}
+                    audioInputs={audioInputs}
+                    selectedAudioInputId={selectedAudioInputId}
+                    setSelectedAudioInputId={setSelectedAudioInputId}
+                    channelMode={channelMode}
+                    setChannelMode={setChannelMode}
+                    inputLevelStore={inputLevelStore}
                     vdStates={vdStates}
                     setVdStates={setVdStates}
                     isGenerating={isGenerating}
@@ -1508,22 +1768,6 @@ function App() {
               </ErrorBoundary>
             </div>
             <div className="studio-right">
-              <WorkspaceVoices
-                defineMethod={defineMethod}
-                profiles={profiles}
-                selectedProfile={selectedProfile}
-                setSelectedProfile={setSelectedProfile}
-                previewLoading={previewLoading}
-                handleSelectProfile={handleSelectProfile}
-                handleDeleteProfile={handleDeleteProfile}
-                handlePreviewVoice={handlePreviewVoice}
-                handleUnlockProfile={handleUnlockProfile}
-                openVoiceProfile={openVoiceProfile}
-                onOpenVoicePreview={(profileId) => {
-                  setVoicePreviewProfileId(profileId || '');
-                  setIsVoicePreviewOpen(true);
-                }}
-              />
               <WorkspaceHistory
                 history={history}
                 handleSaveHistoryAsProfile={handleSaveHistoryAsProfile}
@@ -1531,11 +1775,14 @@ function App() {
                 handleNativeExport={handleNativeExport}
                 restoreHistory={restoreHistory}
                 deleteHistory={deleteHistory}
+                clearHistory={() => clearWorkspaceHistory('synth')}
+                toggleStarHistory={toggleStarHistory}
+                playTakeAsOutput={playTakeAsOutput}
               />
             </div>
           </div>
         )}
-      </div>
+      </ModeLifecycleBoundary>
 
       {/* ── SIDEBAR ── */}
       <Suspense fallback={<LazyFallback />}>
@@ -1636,6 +1883,12 @@ function App() {
           />
         </Suspense>
       )}
+
+      {/* ═══ GLOBAL AUDIO MINI-PLAYER (grid row 3, above the footer) ═══
+          Subsumes the #1032 PlaybackStopPill: waveform + seek + time + stop
+          for every playBlobAudio playback that has no on-screen player. As a
+          real grid row it can never overlap row-2 content or the footer. */}
+      <GlobalAudioPlayer />
 
       {/* ═══ BOTTOM LOGS PANEL (VSCode-style) ═══ */}
       <Suspense fallback={null}>

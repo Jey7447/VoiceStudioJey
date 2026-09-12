@@ -288,6 +288,47 @@ class TestBurnPolicyAndFittedCues:
         out = _apply_fitted_times(segs, fitted)
         assert out[0]["end"] == 3.8
 
+    def test_apply_fitted_times_scales_word_times_linearly(self):
+        """Karaoke burn-in: persisted word times ride onto the fitted span
+        with the same id matching the SRT burn uses."""
+        from api.routers.dub_export import _apply_fitted_times
+        job = _smart_fit_job()
+        job["segments"][0]["words"] = [
+            {"text": "Hello", "start": 1.0, "end": 2.0},
+            {"text": "there", "start": 2.0, "end": 3.0},
+        ]
+        out = _apply_fitted_times(job["segments"], _FITTED)
+        # [1.0, 3.0] → [1.0, 3.75]: ratio 1.375.
+        assert out[0]["words"] == [
+            {"text": "Hello", "start": 1.0, "end": 2.375},
+            {"text": "there", "start": 2.375, "end": 3.75},
+        ]
+        # Non-destructive: the source words keep original times.
+        assert job["segments"][0]["words"][0]["end"] == 2.0
+
+    def test_apply_fitted_times_drops_words_on_degenerate_span(self):
+        from api.routers.dub_export import _apply_fitted_times
+        segs = [{"id": "a", "start": 1.0, "end": 1.0, "text": "x",
+                 "words": [{"text": "x", "start": 1.0, "end": 1.0}]}]
+        out = _apply_fitted_times(segs, _FITTED)
+        assert "words" not in out[0]
+
+    def test_write_burn_ass_uses_fitted_word_times(self, tmp_path):
+        from api.routers.dub_export import _write_burn_ass
+        job = _smart_fit_job()
+        job["segments"][0]["words"] = [
+            {"text": "Hello", "start": 1.0, "end": 2.0},
+            {"text": "there", "start": 2.0, "end": 3.0},
+        ]
+        path = _write_burn_ass(job, str(tmp_path), "stamp",
+                               fitted_segments=_FITTED)
+        assert path.endswith("burn_subs_stamp.ass")
+        content = open(path, encoding="utf-8").read()
+        assert "Dialogue: 0,0:00:01.00,0:00:03.75,Default," in content
+        # "Hello" sweeps until "there" starts on the FITTED timeline:
+        # 2.375 - 1.0 = 1.375 s → 138 cs (\kf rounds to centiseconds).
+        assert "{\\kf138}Hello {\\kf138}there" in content
+
     def test_write_burn_srt_uses_fitted_times(self, tmp_path):
         from api.routers.dub_export import _write_burn_srt
         job = _smart_fit_job()
@@ -515,8 +556,10 @@ def _seed_retime_job(dc, tmp_path: Path, video: Path, track_dur: float) -> str:
     job_dir.mkdir(parents=True, exist_ok=True)
     track_wav = job_dir / "dubbed_de.wav"
     _make_sine_wav(track_wav, track_dur)
+    local_video = job_dir / "source.mp4"
+    local_video.write_bytes(video.read_bytes())
     job = _smart_fit_job(track_dur=track_dur)
-    job["video_path"] = str(video)
+    job["video_path"] = str(local_video)
     job["dubbed_tracks"]["de"]["path"] = str(track_wav)
     dc._dub_jobs[job_id] = job
     return job_id

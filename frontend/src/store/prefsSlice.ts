@@ -18,7 +18,7 @@ type DictationMode = 'toggle' | 'hold';
 /** Default sherpa dictation model id — matches the backend
  * `sherpa_dictation.DEFAULT_MODEL_ID`. Used only as the pre-hydration seed;
  * the authoritative value comes from `GET /dictation/prefs`. */
-const DEFAULT_DICTATION_MODEL_ID = 'sherpa-parakeet-tdt-v3';
+const DEFAULT_DICTATION_MODEL_ID = 'sherpa-whisper-tiny';
 
 /**
  * Global UI font. Applied app-wide by overriding the `--font-sans` CSS custom
@@ -60,6 +60,16 @@ export const FONT_STACKS: Record<FontId, string | null> = {
 type TimingStrategy = 'concise' | 'smart_fit' | 'stretch_video' | 'strict_slot';
 
 /**
+ * Dub voice-identity mode (DubRequest.voice_match). `per_line` (default —
+ * unchanged Wave 3.2 behaviour) clones each line from a reference cut from
+ * its OWN source audio: best prosody match, but the voice identity can drift
+ * line to line. `consistent` resolves every line of a speaker to ONE
+ * reference — the pooled speaker clone, or (heuristic diarization, where no
+ * speaker clones exist) one deterministic best clip — for a steady identity.
+ */
+type VoiceMatch = 'per_line' | 'consistent';
+
+/**
  * Knob overrides for the `smart_fit` strategy. `null` (default) sends no
  * `fit_options` and the backend uses its canonical FitParams defaults —
  * identical behavior on every platform out of the box.
@@ -74,8 +84,23 @@ interface FitOptions {
 
 export interface PrefsSlice {
   translateQuality: TranslateQuality;
+  /**
+   * Opt-in LLM condensation for doomed dub segments (default OFF). When on,
+   * Translate asks the configured LLM for a shorter meaning-preserving
+   * rewrite of every segment the duration planner marks "impossible" and
+   * attaches it as a per-segment suggestion — never applied automatically.
+   */
+  condenseSuggest: boolean;
   dualSubs: boolean;
   burnSubs: boolean;
+  /**
+   * Hardsub caption style: when burn-in is on, burn a word-timed karaoke
+   * highlight (ASS) instead of static line subtitles. Default OFF — the line
+   * burn stays the out-of-the-box behaviour. Ignored while dualSubs is on
+   * (dual-layout karaoke is unsupported; the Export drawer disables the
+   * control and the backend renders the line burn).
+   */
+  karaokeSubs: boolean;
   glossaryVisible: boolean;
   /**
    * Phase 4.3 — staged checkpoints. When 'on', between-stage banners nudge
@@ -95,9 +120,9 @@ export interface PrefsSlice {
 
   /**
    * How the dub pipeline reconciles natural-rate TTS with the original
-   * timeline. `concise` (default) trims translation to fit; `stretch_video`
-   * stretches the video instead; `strict_slot` compresses the audio to fit
-   * (legacy behaviour, retained for back-compat).
+   * timeline. `strict_slot` (default) compresses audio to fit; `concise`
+   * trims translation while preserving natural-rate audio; `stretch_video`
+   * stretches the video instead.
    */
   timingStrategy: TimingStrategy;
 
@@ -107,20 +132,78 @@ export interface PrefsSlice {
    */
   fitOptions: FitOptions | null;
 
+  /** Dub voice-identity mode — see the VoiceMatch type doc. */
+  voiceMatch: VoiceMatch;
+
+  /**
+   * Opt-in live dub preview (default OFF). When on, editing a segment's
+   * translated text streams TTS for that line over the existing `/ws/tts`
+   * socket (debounced, local playback only) so the user hears the edit
+   * without pressing Generate. Never persisted as job audio — export still
+   * goes through the full-quality generate path.
+   */
+  dubLivePreview: boolean;
+  setDubLivePreview: (on: boolean) => void;
+
+  /**
+   * Last app version whose release notes the user has seen (feat/safe-updates).
+   * `null` = never recorded (fresh install / pre-feature profile): the first
+   * launch baselines it silently so brand-new users don't get a "What's new"
+   * nudge for a version they just installed. After an update,
+   * `whatsNewPending()` flags the mismatch and the footer shows a small
+   * non-blocking "What's new" affordance until the notes are opened.
+   */
+  whatsNewSeenVersion: string | null;
+  setWhatsNewSeenVersion: (v: string | null) => void;
+
+  /**
+   * System-notification ids the user has dismissed (bell + footer tab).
+   * Only info/warn notes are dismissible — errors describe conditions that
+   * need fixing and stay visible until the condition clears. Ids are stable
+   * per condition (e.g. `gpu-unavailable` on a CPU-only box), so a dismissal
+   * is durable across sessions; notes whose id encodes an occurrence (the
+   * `last-run-crash-<ts>` family) naturally re-notify as a fresh id when
+   * they recur. Capped so the list can't grow unbounded.
+   */
+  dismissedNotificationIds: string[];
+  dismissNotification: (id: string) => void;
+
+  /**
+   * LLM dub engine — auto-glossary. One up-front LLM pass over the whole
+   * transcript extracts a theme summary + terminology map, merged with the
+   * manual glossary (manual entries always win) and injected into every
+   * segment's translation prompt so names/terms stay consistent. Only applies
+   * when the translation engine is the LLM one. Default ON.
+   */
+  autoGlossary: boolean;
+  setAutoGlossary: (on: boolean) => void;
+
+  /**
+   * LLM dub engine — reflect pass. After each segment's direct translation,
+   * a critique-then-rewrite step polishes wordy/stiff lines into natural
+   * spoken dialogue. Costs 3 LLM calls per segment instead of 1; any failure
+   * silently keeps the direct translation. Default ON.
+   */
+  reflectPass: boolean;
+  setReflectPass: (on: boolean) => void;
+
   setTranslateQuality: (q: TranslateQuality) => void;
+  setCondenseSuggest: (on: boolean) => void;
   setDualSubs: (on: boolean) => void;
   setBurnSubs: (on: boolean) => void;
+  setKaraokeSubs: (on: boolean) => void;
   setGlossaryVisible: (on: boolean) => void;
   setReviewMode: (mode: 'on' | 'off') => void;
   setShowHeaderLiveStats: (on: boolean) => void;
   setTimingStrategy: (s: TimingStrategy) => void;
   setFitOptions: (o: FitOptions | null) => void;
+  setVoiceMatch: (m: VoiceMatch) => void;
 
   /**
    * Opt-in dictate-over-playback echo cancellation (parity Action 8). When
    * on, dictation streams raw PCM through the server-side NLMS AEC and the
    * audio player taps its output as the echo reference, so dictating while
-   * OmniVoice plays audio doesn't transcribe the playback. Default OFF — the
+   * VoiceStudio plays audio doesn't transcribe the playback. Default OFF — the
    * standard MediaRecorder dictation path is unchanged when off.
    */
   aecEnabled: boolean;
@@ -138,7 +221,7 @@ export interface PrefsSlice {
    *   • dictationMode     — 'toggle' (press to start, press to stop) | 'hold'
    *                          (record while the key is held).
    *   • dictationModelId  — the selected sherpa-onnx model id (e.g.
-   *                          'sherpa-parakeet-tdt-v3'); drives `?model=` on the
+   *                          'sherpa-whisper-tiny'); drives `?model=` on the
    *                          live `/ws/transcribe` socket.
    */
   dictationEnabled: boolean;
@@ -156,15 +239,35 @@ export interface PrefsSlice {
 
   /**
    * Auto-play the output preview as soon as a render finishes (Voice Clone /
-   * Design / profile preview). Default ON — preserves the long-standing
-   * behavior. Users batch-generating segments (#666) can turn it off so each
-   * finished clip doesn't start playing on its own.
+   * Design / profile preview, AND the studio generate path in useTTS —
+   * #1032 wired the latter; #666's toggle only covered the WaveformPlayer
+   * sites). Default ON — preserves the long-standing behavior. Users
+   * batch-generating segments (#666) can turn it off so each finished clip
+   * doesn't start playing on its own.
    */
   autoPlayPreview: boolean;
   setAutoPlayPreview: (on: boolean) => void;
 
   locale: string;
   setLocale: (l: string) => void;
+
+  /**
+   * True once the user has made an EXPLICIT UI-language choice — via the
+   * Settings → General picker or the first-run "Switch to English?" offer.
+   * The `locale` field always has a value (navigator-derived on a fresh
+   * install), so it can't distinguish "detected" from "chosen"; this flag can.
+   * Gates the first-run English offer so it never shows once a user has ever
+   * picked a language. Default false; set true by `setLocale`.
+   */
+  localeChosen: boolean;
+
+  /**
+   * True once the first-run "Switch to English?" offer has been shown and
+   * acted on or dismissed. One-time: guarantees the offer never reappears
+   * after the user answered it (or kept their language) once.
+   */
+  langPromptSeen: boolean;
+  setLangPromptSeen: (seen: boolean) => void;
 
   theme: ThemeId;
   setTheme: (id: ThemeId) => void;
@@ -188,31 +291,54 @@ function _dictationFromPrefs(p: any): Partial<PrefsSlice> {
 
 export const createPrefsSlice: StateCreator<PrefsSlice, [], [], PrefsSlice> = (set, get) => ({
   translateQuality: 'fast',
+  autoGlossary: true,
+  reflectPass: true,
+  condenseSuggest: false,
   dualSubs: false,
   burnSubs: false,
+  karaokeSubs: false,
   glossaryVisible: true,
   reviewMode: 'on',
   showHeaderLiveStats: false,
-  timingStrategy: 'concise',
+  timingStrategy: 'strict_slot',
   fitOptions: null,
+  voiceMatch: 'per_line',
+  dubLivePreview: false,
+  whatsNewSeenVersion: null,
+  dismissedNotificationIds: [],
   aecEnabled: false,
   autoPlayPreview: true,
 
   // Seeds only — overwritten by loadDictationPrefs() on init. The backend
-  // default is enabled:true / mode:'toggle' / model:Parakeet TDT v3.
+  // default is enabled:true / mode:'toggle' / model:Whisper Tiny.
   dictationEnabled: true,
   dictationMode: 'toggle',
   dictationModelId: DEFAULT_DICTATION_MODEL_ID,
   dictationLoaded: false,
 
   setTranslateQuality: (q) => set({ translateQuality: q }),
+  setAutoGlossary: (on) => set({ autoGlossary: on }),
+  setReflectPass: (on) => set({ reflectPass: on }),
+  setCondenseSuggest: (on) => set({ condenseSuggest: on }),
   setDualSubs: (on) => set({ dualSubs: on }),
   setBurnSubs: (on) => set({ burnSubs: on }),
+  setKaraokeSubs: (on) => set({ karaokeSubs: on }),
   setGlossaryVisible: (on) => set({ glossaryVisible: on }),
   setReviewMode: (mode) => set({ reviewMode: mode }),
   setShowHeaderLiveStats: (on) => set({ showHeaderLiveStats: on }),
   setTimingStrategy: (s) => set({ timingStrategy: s }),
   setFitOptions: (o) => set({ fitOptions: o }),
+  setVoiceMatch: (m) => set({ voiceMatch: m }),
+  setDubLivePreview: (on) => set({ dubLivePreview: on }),
+  setWhatsNewSeenVersion: (v) => set({ whatsNewSeenVersion: v }),
+  dismissNotification: (id) =>
+    set((s) => ({
+      // Dedupe + keep the newest 50: stable ids make re-dismissal a no-op,
+      // and occurrence-stamped ids (last-run-crash-<ts>) age out the oldest.
+      dismissedNotificationIds: [...s.dismissedNotificationIds.filter((x) => x !== id), id].slice(
+        -50,
+      ),
+    })),
   setAecEnabled: (on) => set({ aecEnabled: on }),
   setAutoPlayPreview: (on) => set({ autoPlayPreview: on }),
 
@@ -284,7 +410,14 @@ export const createPrefsSlice: StateCreator<PrefsSlice, [], [], PrefsSlice> = (s
           return match || 'en';
         })()
       : 'en',
-  setLocale: (l) => set({ locale: l }),
+  // Any setLocale call is a deliberate user choice (the only callers are the
+  // Settings picker and the first-run English offer), so record it as such —
+  // this is what tells the first-run offer "the user already decided".
+  setLocale: (l) => set({ locale: l, localeChosen: true }),
+
+  localeChosen: false,
+  langPromptSeen: false,
+  setLangPromptSeen: (seen) => set({ langPromptSeen: seen }),
 
   theme: 'gruvbox',
   setTheme: (id) => {

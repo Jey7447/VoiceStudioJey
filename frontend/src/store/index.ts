@@ -11,11 +11,13 @@
  *     here.
  *   - Selectors live at call sites (`useStore(s => s.foo)`).
  *
- * localStorage persistence uses zustand's own middleware so reloads keep
- * your quality/dual-subs/glossary-visibility choice.
+ * Zustand persistence keeps bounded preferences in localStorage and stores
+ * unbounded long-form documents in IndexedDB.
  */
 import { create } from 'zustand';
-import { persist, createJSONStorage } from 'zustand/middleware';
+import { persist } from 'zustand/middleware';
+
+import { createLongformZustandStorage } from '../utils/longformPersistence';
 
 import type { PrefsSlice } from './prefsSlice';
 import { createPrefsSlice, FONT_OPTIONS, FONT_STACKS } from './prefsSlice';
@@ -32,8 +34,13 @@ import type { GenerateSlice } from './generateSlice';
 import { createGenerateSlice } from './generateSlice';
 import type { PillSlice } from './pillSlice';
 import { createPillSlice } from './pillSlice';
-import type { LongformSlice } from './longformSlice';
-import { createLongformSlice, genProjectId } from './longformSlice';
+import type { LongformOverrides, LongformSlice } from './longformSlice';
+import {
+  createLongformSlice,
+  DEFAULT_OVERRIDES,
+  genProjectId,
+  SLICE_DEFAULTS,
+} from './longformSlice';
 import type { UpdaterSlice } from './updaterSlice';
 import { createUpdaterSlice } from './updaterSlice';
 import type { GallerySlice } from './gallerySlice';
@@ -54,6 +61,68 @@ export type AppStore = PrefsSlice &
   GallerySlice &
   ReleasesSlice &
   DonationSlice;
+
+export const APP_STORE_KEY = 'omnivoice.app';
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function nullableFiniteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function normalizeLongformOverrides(value: unknown): LongformOverrides {
+  if (!isRecord(value)) return { ...DEFAULT_OVERRIDES };
+  return {
+    numStep: nullableFiniteNumber(value.numStep),
+    guidanceScale: nullableFiniteNumber(value.guidanceScale),
+    posTemp: nullableFiniteNumber(value.posTemp),
+    classTemp: nullableFiniteNumber(value.classTemp),
+    postprocess:
+      typeof value.postprocess === 'boolean' ? value.postprocess : DEFAULT_OVERRIDES.postprocess,
+    seed: nullableFiniteNumber(value.seed),
+    varyRepeats:
+      typeof value.varyRepeats === 'boolean' ? value.varyRepeats : DEFAULT_OVERRIDES.varyRepeats,
+    emoText: typeof value.emoText === 'string' ? value.emoText : DEFAULT_OVERRIDES.emoText,
+    emoAlpha: nullableFiniteNumber(value.emoAlpha),
+  };
+}
+
+/** Shape-safe, non-throwing upgrade for the legacy v4 project records. */
+export function migrateAppStore(persisted: unknown, version: number): Partial<AppStore> {
+  if (!isRecord(persisted)) return {} as Partial<AppStore>;
+  const p = persisted;
+  if (version < 4 && !Object.prototype.hasOwnProperty.call(p, 'timingStrategy')) {
+    p.timingStrategy = 'concise';
+  }
+  if (version < 5) {
+    const raw = Array.isArray(p.storyProjects) ? p.storyProjects : [];
+    p.storyProjects = raw.filter(isRecord).map((sp) => ({
+      ...sp,
+      id: typeof sp.id === 'string' && sp.id.trim() ? sp.id : genProjectId(),
+      name: typeof sp.name === 'string' && sp.name.trim() ? sp.name : 'Untitled',
+      mode: sp.mode === 'audiobook' ? 'audiobook' : 'stories',
+      cast: Array.isArray(sp.cast) ? sp.cast : [],
+      tracks: Array.isArray(sp.tracks) ? sp.tracks : [],
+      script: typeof sp.script === 'string' ? sp.script : SLICE_DEFAULTS.script,
+      meta: isRecord(sp.meta) ? sp.meta : {},
+      lexicon: isRecord(sp.lexicon) ? sp.lexicon : {},
+      coverRef: isRecord(sp.coverRef) ? sp.coverRef : null,
+      outputFormat: sp.outputFormat === 'mp3' ? 'mp3' : 'm4b',
+      loudness: sp.loudness === 'acx' || sp.loudness === 'podcast' ? sp.loudness : 'off',
+      defaultVoice: typeof sp.defaultVoice === 'string' ? sp.defaultVoice : null,
+      language: typeof sp.language === 'string' ? sp.language : SLICE_DEFAULTS.language,
+      overrides: normalizeLongformOverrides(sp.overrides),
+      voiceCast: isRecord(sp.voiceCast) ? sp.voiceCast : {},
+      updatedAt:
+        typeof sp.updatedAt === 'number' && Number.isFinite(sp.updatedAt) ? sp.updatedAt : 0,
+    }));
+    p.projectMode = 'stories';
+  }
+  if (version < 7) p.uiScaleConfigured = true;
+  return p as Partial<AppStore>;
+}
 
 /**
  * `useAppStore` — single root store. Don't create siblings. Slices compose here.
@@ -78,18 +147,30 @@ export const useAppStore = create<AppStore>()(
       ...createDonationSlice(set, get, api),
     }),
     {
-      name: 'omnivoice.app',
-      storage: createJSONStorage(() => localStorage),
+      name: APP_STORE_KEY,
+      storage: createLongformZustandStorage(),
       // Only persist user prefs + glossary. Pipeline / transient state is opt-out.
       partialize: (s) => ({
         translateQuality: s.translateQuality,
+        autoGlossary: s.autoGlossary,
+        reflectPass: s.reflectPass,
+        condenseSuggest: s.condenseSuggest,
         dualSubs: s.dualSubs,
         burnSubs: s.burnSubs,
+        karaokeSubs: s.karaokeSubs,
         glossaryVisible: s.glossaryVisible,
         reviewMode: s.reviewMode,
         showHeaderLiveStats: s.showHeaderLiveStats,
         timingStrategy: s.timingStrategy,
         fitOptions: s.fitOptions,
+        voiceMatch: s.voiceMatch,
+        dubLivePreview: s.dubLivePreview,
+        // "What's new" affordance (feat/safe-updates) — remembering which
+        // version's notes were seen only works if it survives restarts.
+        whatsNewSeenVersion: s.whatsNewSeenVersion,
+        // Dismissed system-notification ids — a dismissal only means anything
+        // if it survives restarts (the notes are re-emitted on every poll).
+        dismissedNotificationIds: s.dismissedNotificationIds,
         autoPlayPreview: s.autoPlayPreview,
         mode: s.mode,
         defineMethod: s.defineMethod,
@@ -97,7 +178,14 @@ export const useAppStore = create<AppStore>()(
         isSidebarProjectsCollapsed: s.isSidebarProjectsCollapsed,
         sidebarTab: s.sidebarTab,
         uiScale: s.uiScale,
+        uiScaleConfigured: s.uiScaleConfigured,
+        // Rail vs titlebar tabs — a chrome preference, so it sticks like scale.
+        navStyle: s.navStyle,
         locale: s.locale,
+        // Explicit-choice + first-run-offer flags must survive restarts, or the
+        // one-time "Switch to English?" offer would re-nag on every launch.
+        localeChosen: s.localeChosen,
+        langPromptSeen: s.langPromptSeen,
         theme: s.theme,
         font: s.font,
         // Generate-tab prefs — users expect their synthesis knobs to stick.
@@ -117,16 +205,9 @@ export const useAppStore = create<AppStore>()(
         galleryViewMode: s.galleryViewMode,
         galleryZone: s.galleryZone,
         archetypeFilters: s.archetypeFilters,
-        // Stories Editor — persist the project; strip transient runtime fields
-        // (generating, audioUrl) so a dead blob: URL / stuck spinner never rehydrates.
-        storyTracks: s.storyTracks.map(({ id, character, text, profileId, emotion, speed }) => ({
-          id,
-          character,
-          text,
-          profileId,
-          emotion,
-          speed,
-        })),
+        // The split storage adapter moves long-form payloads to IndexedDB and
+        // strips transient runtime fields there, at the deferred commit point.
+        storyTracks: s.storyTracks,
         cast: s.cast,
         storyProjects: s.storyProjects,
         currentProjectId: s.currentProjectId,
@@ -135,10 +216,17 @@ export const useAppStore = create<AppStore>()(
         script: s.script,
         meta: s.meta,
         lexicon: s.lexicon,
+        voiceCast: s.voiceCast,
         coverRef: s.coverRef,
         outputFormat: s.outputFormat,
         loudness: s.loudness,
         defaultVoice: s.defaultVoice,
+        // Server filename of the last finished longform render (#1139) — a
+        // plain /audio path (never a blob: URL), so rehydrating it is safe
+        // and keeps the finished book's Download affordance reachable.
+        lastOutput: s.lastOutput,
+        lastOutputScript: s.lastOutputScript,
+        lastOutputChapters: s.lastOutputChapters,
         projectMode: s.projectMode,
         // Donation prompt state (#007) — persist everything EXCEPT
         // `shownThisSession` so the ≤1/session cap resets on every launch.
@@ -150,59 +238,17 @@ export const useAppStore = create<AppStore>()(
         firedMilestones: s.firedMilestones,
         optedOut: s.optedOut,
       }),
-      version: 6,
+      version: 9,
+      // IndexedDB hydration is asynchronous. Bootstrap resolves main/widget
+      // ownership first, then explicitly hydrates before React renders.
+      skipHydration: true,
       // Drop old persisted shapes rather than crashing the app. Every field
       // has a safe default in its slice, so v1/v2/v3 users pick up v4 defaults
       // for new fields (timingStrategy etc.) and keep any keys we still write
       // today. Upgrade > crash.
-      migrate: (persisted, version) => {
-        if (!persisted || typeof persisted !== 'object') return {} as Partial<AppStore>; // D1
-        const p = persisted as any;
-        if (version < 4) {
-          // v1 → v2 added reviewMode; v2 → v3 added mode/sidebar/generate knobs;
-          // v3 → v4 added timingStrategy. All of those have slice defaults, so
-          // passing through is sufficient — then fall through to the < 5 branch.
-        }
-        if (version < 5) {
-          // #31: each saved Stories project becomes a LongformProject. Defaults
-          // FIRST, real fields LAST (spread wins), so id/name/cast/tracks/
-          // updatedAt always survive; new book-identity fields seed to defaults.
-          // The field name stays `storyProjects` (every consumer reads it), so
-          // no key rename — only the per-project shape is enriched. Never throws;
-          // malformed entries are dropped (D2/D3).
-          const raw = Array.isArray(p.storyProjects) ? p.storyProjects : []; // D2
-          p.storyProjects = raw
-            .filter((sp: any) => sp && typeof sp === 'object') // D3
-            .map((sp: any) => ({
-              id: genProjectId(),
-              name: 'Untitled',
-              mode: 'stories',
-              cast: [],
-              tracks: [],
-              script: '',
-              meta: {},
-              lexicon: {},
-              coverRef: null,
-              outputFormat: 'm4b',
-              loudness: 'off',
-              defaultVoice: null,
-              updatedAt: 0,
-              ...sp,
-            }));
-          // Loose working fields seed to defaults; absent ones fall through to
-          // slice init. A dangling currentProjectId is harmless (loadProject
-          // no-ops). NB: set `projectMode` (the long-form field), NOT `mode`
-          // (that's the app navigation mode owned by uiSlice).
-          p.projectMode = 'stories';
-          // fall through to the < 6 branch
-        }
-        if (version < 6) {
-          // #007: donation-prompt fields are new. Every field has a safe slice
-          // default (INITIAL_DONATION), so a v5→v6 user simply picks those up —
-          // pass through untouched. Never throws.
-        }
-        return p as Partial<AppStore>; // also covers version > 6 (downgrade→upgrade)
-      },
+      // v9 moves unbounded long-form payloads to IndexedDB. The storage adapter
+      // commits that durable record before this migration can trim localStorage.
+      migrate: migrateAppStore,
     },
   ),
 );

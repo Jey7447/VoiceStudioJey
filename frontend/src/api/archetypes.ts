@@ -44,6 +44,8 @@ export interface ArchetypePage {
 }
 
 export interface ArchetypeFilters {
+  /** Free-text substring match over name/instruct — the picker search box. */
+  q?: string | null;
   use_case?: string | null;
   gender?: string | null;
   age?: string | null;
@@ -69,8 +71,8 @@ export const listArchetypes = (filters: ArchetypeFilters = {}): Promise<Archetyp
 };
 
 /** Full URL for an archetype preview clip (use as an <audio> src). */
-export const archetypePreviewUrl = (id: string): string =>
-  apiUrl(`/archetypes/${encodeURIComponent(id)}/preview`);
+export const archetypePreviewUrl = (id: string, local = false): string =>
+  apiUrl(`/archetypes/${encodeURIComponent(id)}/preview${local ? '?local=true' : ''}`);
 
 /** Materialize an archetype into a reusable voice profile. */
 export const useArchetypeAsProfile = (

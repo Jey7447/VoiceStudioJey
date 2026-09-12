@@ -54,9 +54,12 @@ class LLMBackend(ABC):
     def model_name(self) -> str: ...
 
     @abstractmethod
-    def chat(self, *, system: str, user: str, timeout: Optional[float] = None) -> str:
+    def chat(self, *, system: str, user: str, timeout: Optional[float] = None,
+             temperature: Optional[float] = None) -> str:
         """One-shot chat completion. Returns the assistant content string.
         Raises on failure — callers decide whether to fallback gracefully.
+        ``temperature`` is only sent to the provider when set — callers that
+        leave it None keep the provider default (existing behavior).
         """
 
 
@@ -67,8 +70,18 @@ class OpenAICompatBackend(LLMBackend):
     id = "openai-compat"
     display_name = "OpenAI-compatible (real OpenAI, Ollama, LM Studio, …)"
 
-    def __init__(self):
+    def __init__(self, provider=None):
+        """``provider``: optional ``llm_providers.Provider`` to bind this
+        instance to (LLM Skills per-skill routing). None keeps the historical
+        behavior — resolve the ACTIVE provider at call time."""
         self._client = None
+        self._provider = provider
+
+    def _resolve_provider(self):
+        if self._provider is not None:
+            return self._provider
+        from services import llm_providers
+        return llm_providers.active_provider()
 
     @classmethod
     def is_available(cls) -> tuple[bool, str]:
@@ -85,7 +98,7 @@ class OpenAICompatBackend(LLMBackend):
         if p is None:
             return False, (
                 "No LLM configured. Add a provider key in Settings → LLM Providers "
-                "(OpenAI/OpenRouter/Groq/… or a local Ollama), or set "
+                "(OpenAI/OpenRouter/OrcaRouter/Groq/… or a local Ollama), or set "
                 "TRANSLATE_BASE_URL (+ TRANSLATE_API_KEY)."
             )
         if not llm_providers.resolve_base_url(p):
@@ -97,7 +110,7 @@ class OpenAICompatBackend(LLMBackend):
     @property
     def model_name(self) -> str:
         from services import llm_providers
-        p = llm_providers.active_provider()
+        p = self._resolve_provider()
         if p is not None:
             return llm_providers.resolve_model(p)
         return os.environ.get("TRANSLATE_MODEL", "gpt-4o-mini")
@@ -107,7 +120,7 @@ class OpenAICompatBackend(LLMBackend):
             return self._client
         from openai import OpenAI
         from services import llm_providers
-        p = llm_providers.active_provider()
+        p = self._resolve_provider()
         if p is None:
             raise RuntimeError("LLM not configured. See `is_available()` for the hint.")
         base_url = llm_providers.resolve_base_url(p)
@@ -117,35 +130,48 @@ class OpenAICompatBackend(LLMBackend):
         kw = {"api_key": api_key}
         if base_url:
             kw["base_url"] = base_url
-        self._client = OpenAI(**kw)
+        # max_retries=0 so a 429 + Retry-After can't make one chat() sleep
+        # through the Autofit fit-pass wall-clock budget (speech_rate).
+        self._client = OpenAI(max_retries=0, **kw)
         return self._client
 
-    def chat(self, *, system: str, user: str, timeout: Optional[float] = None) -> str:
+    def chat(self, *, system: str, user: str, timeout: Optional[float] = None,
+             temperature: Optional[float] = None) -> str:
         return self.chat_messages(
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
             timeout=timeout,
+            temperature=temperature,
         )
 
-    def chat_messages(self, *, messages: list[dict], timeout: Optional[float] = None) -> str:
+    def chat_messages(self, *, messages: list[dict], timeout: Optional[float] = None,
+                      temperature: Optional[float] = None) -> str:
         """One-shot completion over a full message list.
 
         Additive surface for callers that need structured few-shot turns
         (dictation refinement, Wave 2.1) — small local models pattern-match
         and echo inline examples, so examples must arrive as prior chat
         turns, not inside the system prompt.
+
+        ``temperature`` is only forwarded when set (Cinematic/Autofit pin 0.2
+        — the provider default of 1.0 makes local models drift and invent);
+        every other caller leaves it None and keeps the provider default.
         """
         if timeout is None:
             try:
                 timeout = float(os.environ.get("OMNIVOICE_LLM_TIMEOUT", "45"))
             except ValueError:
                 timeout = 45.0
+        kw = {}
+        if temperature is not None:
+            kw["temperature"] = temperature
         res = self._get_client().chat.completions.create(
             model=self.model_name,
             timeout=timeout,
             messages=messages,
+            **kw,
         )
         return (res.choices[0].message.content or "").strip()
 
@@ -205,13 +231,10 @@ def list_backends() -> list[dict]:
     for bid, cls in _REGISTRY.items():
         try:
             ok, msg = cls.is_available()
-        except Exception as exc:
+        except Exception:
             ok = False
-            msg = f"{type(exc).__name__}: {exc}"
-            logger.warning(
-                "llm list_backends: %s.is_available() raised — degrading "
-                "gracefully so the picker still renders: %s", bid, msg,
-            )
+            msg = "Availability probe failed; check the backend log."
+            logger.warning("llm list_backends: availability probe failed for registered backend %s", bid)
         if ok:
             _LAST_ERRORS.pop(bid, None)
         else:
@@ -228,8 +251,31 @@ def list_backends() -> list[dict]:
             "effective_device": "network",
             "routing_status": "n/a",
             "routing_reason": None,
+            # The openai-compat family entry and the LLM Providers panel are
+            # ONE system (this backend resolves through the active provider),
+            # but the UI presented them as unrelated. Naming the resolved
+            # provider + model here lets the catalogue row say which endpoint
+            # actually answers, instead of a generic family label.
+            "hint": _provider_hint(bid) if ok else None,
         })
     return out
+
+
+def _provider_hint(bid: str) -> str | None:
+    """``Provider · model`` for the openai-compat row, None for everything else."""
+    if bid != "openai-compat":
+        return None
+    try:
+        from services import llm_providers
+        p = llm_providers.active_provider()
+        if p is None:
+            return None
+        model = llm_providers.resolve_model(p)
+        return f"{p.display_name} · {model}" if model else p.display_name
+    except Exception:
+        # The hint is decoration; a provider-registry hiccup must not take
+        # down the whole engines listing.
+        return None
 
 
 def active_backend_id() -> str:

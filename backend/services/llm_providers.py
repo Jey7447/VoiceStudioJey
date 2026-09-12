@@ -1,4 +1,4 @@
-"""LLM provider registry — the OpenAI-compatible providers OmniVoice can use
+"""LLM provider registry — the OpenAI-compatible providers VoiceStudio can use
 for Cinematic / Autofit translation (and any future LLM feature).
 
 Every provider here speaks the OpenAI chat-completions shape, so a single
@@ -24,9 +24,13 @@ users.
 """
 from __future__ import annotations
 
+import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
+
+logger = logging.getLogger("omnivoice.llm_providers")
 
 # Settings-store row names (non-secret overrides live in the plaintext table;
 # keys live in the encrypted secret table under ``llm_key.<id>``).
@@ -52,6 +56,10 @@ class Provider:
     # the pre-registry behaviour where a lone TRANSLATE_BASE_URL was usable
     # keyless.
     key_optional: bool = False
+    # True when ``default_model`` is a placeholder rather than a model this
+    # provider will accept. LM Studio serves whatever the user has loaded, so
+    # there is no name we can ship that is right — see resolve_model.
+    model_is_placeholder: bool = False
     needs_account: bool = False   # Cloudflare: base_url needs an account id
     account_env: Optional[str] = None
     signup_url: str = ""
@@ -73,6 +81,11 @@ _PROVIDERS: tuple[Provider, ...] = (
              model_env="OPENROUTER_MODEL",
              signup_url="https://openrouter.ai/keys",
              notes="One key, hundreds of models incl. free tiers."),
+    Provider("orcarouter", "OrcaRouter", "https://api.orcarouter.ai/v1",
+             "openai/gpt-5.5",
+             key_envs=("ORCAROUTER_API_KEY",), base_url_env="ORCAROUTER_BASE_URL",
+             model_env="ORCAROUTER_MODEL",
+             signup_url="https://www.orcarouter.ai"),
     Provider("groq", "Groq", "https://api.groq.com/openai/v1",
              "llama-3.3-70b-versatile",
              key_envs=("GROQ_API_KEY",), base_url_env="GROQ_BASE_URL",
@@ -140,11 +153,16 @@ _PROVIDERS: tuple[Provider, ...] = (
              base_url_env="OLLAMA_BASE_URL", model_env="OLLAMA_MODEL",
              signup_url="https://ollama.com",
              notes="Fully offline. Run `ollama pull llama3.1` first."),
+    # `local-model` is a placeholder, NOT a model id — LM Studio serves
+    # whatever the user has loaded and rejects a name it does not know, which
+    # is why translation failed here while Ollama (whose default `llama3.1` is
+    # a real name people actually pull) worked on the same machine (#1332).
+    # resolve_model asks the server instead of shipping a guess.
     Provider("lmstudio", "LM Studio (local)", "http://localhost:1234/v1",
-             "local-model", local=True,
+             "local-model", local=True, model_is_placeholder=True,
              base_url_env="LMSTUDIO_BASE_URL", model_env="LMSTUDIO_MODEL",
              signup_url="https://lmstudio.ai",
-             notes="Fully offline. Start the LM Studio local server."),
+             notes="Fully offline. Start the LM Studio local server and load a model."),
     Provider("custom", "Custom (OpenAI-compatible)", "", "",
              key_envs=("TRANSLATE_API_KEY",), base_url_env="TRANSLATE_BASE_URL",
              model_env="TRANSLATE_MODEL", key_optional=True,
@@ -172,27 +190,150 @@ def _env_first(names: tuple[str, ...]) -> Optional[str]:
     return None
 
 
-def resolve_base_url(p: Provider) -> str:
+def resolve_account_id(p: Provider) -> str:
+    """The Cloudflare-style account id: env override → stored → empty."""
+    from services import settings_store
+    return (
+        (p.account_env and os.environ.get(p.account_env))
+        or settings_store.get_text(f"llm.account.{p.id}")
+        or ""
+    )
+
+
+def resolve_base_url(p: Provider, *, substitute: bool = True) -> str:
+    """Resolve a provider's base URL (env → stored override → default).
+
+    ``substitute`` interpolates ``{account_id}`` for account-scoped providers
+    (Cloudflare) so the *client* gets a working URL. The UI passes
+    ``substitute=False`` so the field shows/saves the raw template — baking the
+    substituted value back into a stored override would freeze the URL and make
+    later account-id changes silently no-op (the bug this guards against).
+    """
     from services import settings_store
     val = (
         (p.base_url_env and os.environ.get(p.base_url_env))
         or settings_store.get_text(_BASE_URL_KEY + p.id)
         or p.default_base_url
     )
-    if p.needs_account and val and "{account_id}" in val:
-        acct = (p.account_env and os.environ.get(p.account_env)) or \
-            settings_store.get_text(f"llm.account.{p.id}") or ""
-        val = val.replace("{account_id}", acct)
+    if substitute and p.needs_account and val and "{account_id}" in val:
+        val = val.replace("{account_id}", resolve_account_id(p))
     return val or ""
 
 
+#: How long a discovered model id is trusted. Bounded rather than permanent
+#: because the user can swap the loaded model inside LM Studio without touching
+#: VoiceStudio at all — an unbounded cache would keep sending the unloaded name
+#: and 404 every translation until a restart (greptile).
+DISCOVERY_TTL_S = 300.0
+
+#: How long a FAILED probe is remembered. Without this, a server that is
+#: stopped costs a 5s timeout on *every translated segment* — a 200-segment dub
+#: would spend 1000s discovering nothing, which is worse than the bug being
+#: fixed (greptile / CodeRabbit). Short, so starting the server recovers within
+#: seconds rather than needing a restart.
+DISCOVERY_FAILURE_TTL_S = 30.0
+
+#: provider id → (model id or None, monotonic expiry). ``None`` is a remembered
+#: failure, which is why this cannot be a plain ``dict[str, str]``: "no entry"
+#: and "we looked and there was nothing" have to be distinguishable or the
+#: negative case cannot be cached at all.
+_DISCOVERED_MODEL: dict[str, tuple[Optional[str], float]] = {}
+
+
+def forget_discovered_models(pid: Optional[str] = None) -> None:
+    """Drop the discovery cache (all providers, or one).
+
+    Called whenever the user changes a provider's model or base URL: keeping a
+    model discovered from the previous server would silently ignore the edit,
+    which is a worse failure than the one this whole path exists to fix. Also
+    called when a request is rejected for an unknown model, so a swap made
+    inside the local app self-heals on the next attempt rather than at the next
+    TTL expiry.
+    """
+    if pid is None:
+        _DISCOVERED_MODEL.clear()
+    else:
+        _DISCOVERED_MODEL.pop(pid, None)
+
+
+def _cached_discovery(pid: str) -> tuple[bool, Optional[str]]:
+    """``(hit, value)``. ``hit`` is False once the entry has expired, so a
+    remembered failure (value ``None``) is still a hit until it ages out."""
+    entry = _DISCOVERED_MODEL.get(pid)
+    if entry is None:
+        return False, None
+    value, expires_at = entry
+    if time.monotonic() >= expires_at:
+        _DISCOVERED_MODEL.pop(pid, None)
+        return False, None
+    return True, value
+
+
+def discover_model(p: Provider) -> Optional[str]:
+    """Ask an OpenAI-compatible server which model it is actually serving.
+
+    Only used when we would otherwise send a placeholder. Never raises: a
+    server that is down or does not implement ``/v1/models`` leaves the caller
+    with the placeholder, which is exactly where it was before.
+
+    Both outcomes are cached — success for :data:`DISCOVERY_TTL_S`, failure for
+    :data:`DISCOVERY_FAILURE_TTL_S` — because this runs once per translated
+    segment, so an uncached failure costs a 5s timeout per segment.
+    """
+    hit, cached = _cached_discovery(p.id)
+    if hit:
+        return cached
+    base_url = resolve_base_url(p)
+    if not base_url:
+        return None
+    try:
+        from openai import OpenAI
+
+        # max_retries=0 + a short timeout: this runs in the request path, and a
+        # local server that is not running must fail fast rather than add the
+        # SDK's retry ladder to a translation the user is waiting on.
+        client = OpenAI(api_key=resolve_api_key(p) or "local",
+                        base_url=base_url, max_retries=0)
+        ids = [m.id for m in client.models.list(timeout=5)]
+    except Exception as e:  # noqa: BLE001 — discovery is best-effort by design
+        logger.debug("model discovery failed for %s: %s", p.id, e)
+        _DISCOVERED_MODEL[p.id] = (None, time.monotonic() + DISCOVERY_FAILURE_TTL_S)
+        return None
+    if not ids:
+        _DISCOVERED_MODEL[p.id] = (None, time.monotonic() + DISCOVERY_FAILURE_TTL_S)
+        return None
+    # Deterministic rather than "whatever the server listed first", so two runs
+    # on the same machine pick the same model and a bug report is reproducible.
+    chosen = sorted(ids)[0]
+    if len(ids) > 1:
+        logger.info(
+            "%s has %d models loaded and no model is set in Settings; using %r. "
+            "Pick one in Settings → LLM Providers to choose deliberately.",
+            p.display_name, len(ids), chosen,
+        )
+    _DISCOVERED_MODEL[p.id] = (chosen, time.monotonic() + DISCOVERY_TTL_S)
+    return chosen
+
+
 def resolve_model(p: Provider) -> str:
+    """Env override → stored override → discovered → default.
+
+    Discovery sits between the user's choice and the built-in default so it can
+    never override an explicit setting, and only runs for providers whose
+    default is a placeholder — everyone else keeps a pure, offline resolution.
+    """
     from services import settings_store
-    return (
+    explicit = (
         (p.model_env and os.environ.get(p.model_env))
         or settings_store.get_text(_MODEL_KEY + p.id)
-        or p.default_model
     )
+    if explicit:
+        return explicit
+    if p.model_is_placeholder:
+        discovered = discover_model(p)
+        if discovered:
+            return discovered
+    return p.default_model
 
 
 def resolve_api_key(p: Provider) -> Optional[str]:
@@ -232,6 +373,19 @@ def is_configured(p: Provider) -> bool:
 
 # ── Active provider selection ─────────────────────────────────────────────
 
+def stored_active_provider_id() -> Optional[str]:
+    """The user's explicitly-persisted selection ONLY — no env pin, no legacy
+    TRANSLATE_* fallback, no auto-detect.
+
+    ``None`` means the user has never chosen a provider. This is what gates
+    save-activates in the settings router (#963): an explicit save may claim
+    the *empty* slot, but must never steal it from a made choice.
+    """
+    from services import settings_store
+    stored = settings_store.get_text(_ACTIVE_PROVIDER_KEY)
+    return stored if stored and stored in _BY_ID else None
+
+
 def active_provider_id() -> Optional[str]:
     """The provider Cinematic/Autofit should use.
 
@@ -239,12 +393,11 @@ def active_provider_id() -> Optional[str]:
     configured provider → None. Legacy ``TRANSLATE_BASE_URL`` users with no
     explicit selection resolve to ``custom`` (its envs are TRANSLATE_*).
     """
-    from services import settings_store
     env_pick = os.environ.get("LLM_DEFAULT_PROVIDER")
     if env_pick and env_pick in _BY_ID:
         return env_pick
-    stored = settings_store.get_text(_ACTIVE_PROVIDER_KEY)
-    if stored and stored in _BY_ID:
+    stored = stored_active_provider_id()
+    if stored:
         return stored
     # Legacy: a lone TRANSLATE_BASE_URL means the old single-endpoint setup.
     if os.environ.get("TRANSLATE_BASE_URL"):
@@ -286,26 +439,125 @@ def save_overrides(pid: str, *, base_url: Optional[str] = None,
     from services import settings_store
     if pid not in _BY_ID:
         raise ValueError(f"unknown provider {pid!r}")
+    p = _BY_ID[pid]
     if base_url is not None:
-        settings_store.set_text(_BASE_URL_KEY + pid, base_url.strip())
+        bu = base_url.strip()
+        # Never freeze an override that equals the built-in default. Critical
+        # for account-templated URLs (Cloudflare): persisting the shown value
+        # would pin the base_url and stop later account-id edits from taking
+        # effect. Clearing (→ empty) falls the resolver back to the default
+        # template so substitution stays live. Also self-heals a stale override
+        # if a provider's default URL changes in a future release.
+        settings_store.set_text(_BASE_URL_KEY + pid, "" if bu == p.default_base_url else bu)
     if model is not None:
         settings_store.set_text(_MODEL_KEY + pid, model.strip())
+    # Any base_url or model edit can invalidate a discovered id — a stale one
+    # would make the user's change look like it did nothing.
+    if base_url is not None or model is not None:
+        forget_discovered_models(pid)
     if account_id is not None:
         settings_store.set_text(f"llm.account.{pid}", account_id.strip())
 
 
+def _active_env_pin() -> Optional[str]:
+    """The provider id pinned by ``LLM_DEFAULT_PROVIDER`` (if set + valid)."""
+    pick = os.environ.get("LLM_DEFAULT_PROVIDER")
+    return pick if pick and pick in _BY_ID else None
+
+
 def describe(p: Provider) -> dict:
-    """Client-safe provider descriptor — NEVER includes the key material."""
-    return {
+    """Client-safe provider descriptor — NEVER includes the key material.
+
+    The ``*_from_env`` booleans mirror ``key_from_env`` so the UI can disable an
+    env-pinned field (and the make-active button) with an explainer instead of
+    letting the user edit a value the resolver will silently override. ``base_url``
+    is the RAW template (``substitute=False``) so an account-scoped default shows
+    ``{account_id}`` rather than a baked-in value; ``account_id`` is returned
+    separately for account-scoped providers so the field can round-trip.
+    """
+    d = {
         "id": p.id,
         "display_name": p.display_name,
         "local": p.local,
         "needs_account": p.needs_account,
         "signup_url": p.signup_url,
         "notes": p.notes,
-        "base_url": resolve_base_url(p),
+        "base_url": resolve_base_url(p, substitute=False),
         "model": resolve_model(p),
         "has_key": has_key(p),
         "key_from_env": bool(_env_first(p.key_envs)),
+        "base_url_from_env": bool(p.base_url_env and os.environ.get(p.base_url_env)),
+        "model_from_env": bool(p.model_env and os.environ.get(p.model_env)),
+        "active_from_env": _active_env_pin() is not None,
         "configured": is_configured(p),
     }
+    if p.needs_account:
+        d["account_id"] = resolve_account_id(p)
+        d["account_from_env"] = bool(p.account_env and os.environ.get(p.account_env))
+    return d
+
+
+# ── Legacy TRANSLATE_* prefs migration (#963) ──────────────────────────────
+
+# prefs.json row → the custom-provider field it becomes.
+_LEGACY_TRANSLATE_PREFS: tuple[tuple[str, str], ...] = (
+    ("env.TRANSLATE_BASE_URL", "base_url"),
+    ("env.TRANSLATE_MODEL", "model"),
+    ("env.TRANSLATE_API_KEY", "api_key"),
+)
+
+
+def migrate_legacy_translate_prefs() -> bool:
+    """Move the retired (≤v0.3.7) Translation-LLM panel's prefs rows into the
+    ``custom`` provider's own settings-store rows, then delete them.
+
+    Those ``env.TRANSLATE_*`` rows in prefs.json are re-imported into
+    ``os.environ`` on every launch (main.py), and a live ``TRANSLATE_BASE_URL``
+    makes :func:`active_provider_id` resolve to ``custom`` ahead of the stored
+    selection fallbacks — silently hijacking the active slot on every restart
+    (issue #963, "Ollama works until I restart"). Must run BEFORE main.py's
+    prefs→env import so the rows never reach the environment.
+
+    Semantics:
+      * Each value is copied only where the store has no value yet — a user's
+        later edit of the custom provider always wins over legacy leftovers.
+      * The prefs row is deleted afterwards either way, so it can never be
+        re-imported as env again (the migration is one-shot per row).
+      * Real process env vars are NEVER touched — a shell/.env
+        ``TRANSLATE_BASE_URL`` keeps its documented override behavior.
+      * A row whose store write fails is kept in prefs (it still works via the
+        env import this launch and the migration retries next launch).
+
+    Returns True if any prefs row was migrated/removed.
+    """
+    from core import prefs
+    from services import settings_store
+
+    changed = False
+    for prefs_key, field in _LEGACY_TRANSLATE_PREFS:
+        try:
+            raw = prefs.get(prefs_key)
+        except Exception:
+            logger.exception("legacy TRANSLATE prefs read failed (%s)", prefs_key)
+            return changed
+        if raw is None:
+            continue
+        val = str(raw).strip()
+        try:
+            if val:
+                if field == "base_url":
+                    if not settings_store.get_text(_BASE_URL_KEY + "custom"):
+                        save_overrides("custom", base_url=val)
+                elif field == "model":
+                    if not settings_store.get_text(_MODEL_KEY + "custom"):
+                        save_overrides("custom", model=val)
+                else:  # api_key — encrypted store, never overwrite an existing one
+                    if not _key_in_store("custom"):
+                        save_key("custom", val)
+            prefs.delete(prefs_key)
+            changed = True
+        except Exception:
+            # Store not ready (e.g. settings table missing) — keep the prefs
+            # row so the legacy env import still works and we retry next boot.
+            logger.exception("legacy TRANSLATE prefs migration failed (%s)", prefs_key)
+    return changed

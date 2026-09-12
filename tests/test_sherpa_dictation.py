@@ -11,6 +11,7 @@ Also pins the verified ONNX asset filenames so a silent registry typo (the
 streaming zipformer repos use plain `encoder-epoch-99-avg-1.int8.onnx`, NOT a
 `-chunk-16-left-64` variant) fails loudly.
 """
+import builtins
 import os
 import sys
 import types
@@ -139,8 +140,8 @@ def test_seven_models_registered():
     }
     # Exactly one recommended default.
     rec = [s for s in specs if s.recommended]
-    assert [s.id for s in rec] == ["sherpa-parakeet-tdt-v3"]
-    assert sd.DEFAULT_MODEL_ID == "sherpa-parakeet-tdt-v3"
+    assert [s.id for s in rec] == ["sherpa-whisper-tiny"]
+    assert sd.DEFAULT_MODEL_ID == "sherpa-whisper-tiny"
 
 
 def test_verified_filenames_pinned():
@@ -174,6 +175,125 @@ def test_get_spec_accepts_repo_id():
     assert not sd.is_sherpa_model(None)
 
 
+@pytest.mark.parametrize(
+    "native_error",
+    [
+        OSError("native library could not be loaded"),
+        RuntimeError("native runtime initialization failed"),
+    ],
+)
+def test_sherpa_available_degrades_native_loader_failures(monkeypatch, native_error):
+    """A broken platform DLL/dylib/so disables Sherpa without crashing APIs."""
+    from services import sherpa_dictation as sd
+
+    real_import = builtins.__import__
+
+    def import_with_broken_native(name, *args, **kwargs):
+        if name == "sherpa_onnx":
+            raise native_error
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_with_broken_native)
+
+    available, reason = sd.sherpa_available()
+    assert available is False
+    assert type(native_error).__name__ in reason
+
+
+def test_model_resolution_pins_offline_probe_and_download(monkeypatch, tmp_path):
+    from services import hf_revisions, sherpa_dictation as sd
+    import huggingface_hub
+
+    spec = sd.get_spec("sherpa-whisper-tiny")
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+    calls = []
+
+    downloaded = tmp_path / "downloaded"
+
+    def fake_snapshot(**kwargs):
+        calls.append(kwargs)
+        downloaded.mkdir()
+        for filename in spec.files.values():
+            (downloaded / filename).write_bytes(b"model")
+        return str(downloaded)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot)
+    assert sd._resolve_model_dir(spec) == str(downloaded)
+    assert calls == [{
+        "repo_id": spec.repo_id,
+        "revision": hf_revisions.revision_for(spec.repo_id),
+        "allow_patterns": list(spec.files.values()),
+        "cache_dir": str(tmp_path),
+    }]
+
+
+def test_model_resolution_repairs_broken_snapshot_before_loading(monkeypatch, tmp_path):
+    """A zero-byte ONNX entry must be repaired before sherpa receives it (#1733)."""
+    from services import hf_cache_repair, sherpa_dictation as sd
+    import huggingface_hub
+
+    spec = sd.get_spec("sherpa-whisper-tiny")
+    revision = "6" * 40
+    repo = tmp_path / "models--csukuangfj--sherpa-onnx-whisper-tiny"
+    ref = repo / "refs" / "main"
+    ref.parent.mkdir(parents=True)
+    ref.write_text(revision + "\n", encoding="ascii")
+    snapshot = repo / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    broken = snapshot / spec.files["encoder"]
+    broken.write_bytes(b"")
+    for role in ("decoder", "tokens"):
+        (snapshot / spec.files[role]).write_bytes(b"model")
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+
+    repairs = []
+
+    def fake_repair(repo_id, cache_dir):
+        repairs.append((repo_id, cache_dir))
+        broken.write_bytes(b"restored model")
+        return {"ok": True, "outcome": "healed_with_copies", "error": ""}
+
+    monkeypatch.setattr(hf_cache_repair, "repair_repo_cache", fake_repair)
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        lambda **_kwargs: pytest.fail("a repaired snapshot must be reused"),
+    )
+
+    assert sd._resolve_model_dir(spec) == str(snapshot)
+    assert repairs == [(spec.repo_id, str(tmp_path))]
+    assert broken.read_bytes() == b"restored model"
+
+
+def test_model_resolution_probes_preserved_legacy_snapshot(monkeypatch, tmp_path):
+    from services import hf_revisions, sherpa_dictation as sd
+    import huggingface_hub
+
+    spec = sd.get_spec("sherpa-whisper-tiny")
+    legacy_revision = "e" * 40
+    repo = tmp_path / "models--csukuangfj--sherpa-onnx-whisper-tiny"
+    ref = repo / "refs" / "main"
+    ref.parent.mkdir(parents=True)
+    ref.write_text(legacy_revision + "\n", encoding="ascii")
+    snapshot = repo / "snapshots" / legacy_revision
+    snapshot.mkdir(parents=True)
+    for filename in spec.files.values():
+        target = snapshot / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"model")
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+    calls = []
+
+    def fake_snapshot(**kwargs):
+        calls.append(kwargs)
+        return "/cache/legacy"
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot)
+    assert sd._resolve_model_dir(spec) == str(snapshot)
+    assert calls == []
+    assert legacy_revision != hf_revisions.revision_for(spec.repo_id)
+
+
 # ── The 4 recognizer kinds construct + transcribe ───────────────────────────
 
 
@@ -205,7 +325,12 @@ def test_recognizer_kind_constructs_and_transcribes(
     cls = fake_sherpa.OnlineRecognizer if is_online else fake_sherpa.OfflineRecognizer
     assert cls.factory == factory
     assert cls.last_kwargs["provider"] == "cpu"
-    assert cls.last_kwargs["num_threads"] == 2
+    # The thread count is per-model now (the 0.6B Parakeets get more than the
+    # 2-thread base default, capped at the host's cores). What this test owns
+    # is that the recognizer is built with whatever the policy resolved — the
+    # policy's own rules are pinned in tests/test_sherpa_model_sizes.py.
+    assert cls.last_kwargs["num_threads"] == sd._threads_for(spec)
+    assert cls.last_kwargs["num_threads"] >= 2
     if kind == "offline-transducer":
         assert cls.last_kwargs["model_type"] == "nemo_transducer"
     if kind == "offline-whisper":
@@ -266,6 +391,56 @@ def test_capture_backend_honors_dictation_model_id(fake_sherpa, no_download, mon
     ab._capture_backend_key = None
     b2 = ab.get_capture_asr_backend()
     assert b2.spec.id == "sherpa-parakeet-tdt-v3"
+
+
+# ── #888: warmup builds the recognizer; WS sessions reuse it ────────────────
+
+
+def test_sherpa_warmup_builds_recognizer(fake_sherpa, no_download):
+    """warmup() eagerly builds the recognizer so the first live session doesn't
+    pay the ONNX-session load. Before the fix SherpaDictationBackend had no
+    warmup(), so the #888 preload's `if hasattr(backend, 'warmup')` was a no-op
+    and the recognizer stayed cold until the first dictation."""
+    from services import asr_backend as ab
+
+    b = ab.SherpaDictationBackend(model_id="sherpa-whisper-tiny")
+    assert hasattr(b, "warmup")
+    assert b._rec is None
+    b.warmup()
+    assert b._rec is not None  # recognizer built eagerly
+    # Idempotent — a second warmup keeps the SAME recognizer (no rebuild).
+    rec = b._rec
+    b.warmup()
+    assert b._rec is rec
+
+
+def test_get_sherpa_dictation_backend_reuses_warm_singleton(fake_sherpa, no_download, monkeypatch):
+    """A second WS session for the same model reuses the warm backend instead
+    of rebuilding the recognizer (1.3–2.5s) per connect — the reuse that makes
+    the #888 preload actually pay off. A model switch rebuilds (same
+    invalidation as the get_capture_asr_backend singleton)."""
+    from services import asr_backend as ab
+
+    ab._capture_backend = None
+    ab._capture_backend_key = None
+    monkeypatch.setattr(ab.SherpaDictationBackend, "is_available",
+                        classmethod(lambda cls: (True, "ready")))
+
+    b1 = ab.get_sherpa_dictation_backend("sherpa-whisper-tiny")
+    b1.warmup()
+    rec = b1._rec
+
+    b2 = ab.get_sherpa_dictation_backend("sherpa-whisper-tiny")
+    assert b2 is b1, "same-model session rebuilt the backend instead of reusing"
+    assert b2._rec is rec, "recognizer was rebuilt on reuse"
+
+    # Switching the model rebuilds and rebinds the shared singleton.
+    b3 = ab.get_sherpa_dictation_backend("sherpa-parakeet-tdt-v3")
+    assert b3 is not b1
+    assert b3.spec.id == "sherpa-parakeet-tdt-v3"
+
+    ab._capture_backend = None
+    ab._capture_backend_key = None
 
 
 def test_capture_backend_falls_back_when_dictation_disabled(monkeypatch):

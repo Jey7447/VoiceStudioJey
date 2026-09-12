@@ -227,7 +227,11 @@ export default function VoiceProfile({ voiceId, onBack, onOpenProject, onDeleted
       setTestAudioUrl(url);
       // Playback (and autoplay) is handled by the shared WaveformPlayer below.
     } catch (e) {
-      toastErrorWithReport(t('voice_profile.gen_failed', { message: e.message }), e);
+      if (e?.code === 'tts_generation_busy') {
+        toast.error(t('tts_errors.generation_in_progress'));
+      } else {
+        toastErrorWithReport(t('voice_profile.gen_failed', { message: e.message }), e);
+      }
     } finally {
       setTestGenerating(false);
     }
@@ -260,7 +264,7 @@ export default function VoiceProfile({ voiceId, onBack, onOpenProject, onDeleted
   const audioUrl = `${API}/profiles/${voiceId}/audio?t=${profile.is_locked ? 'locked' : 'ref'}`;
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-[var(--space-5)] overflow-y-auto px-[var(--space-6)] py-[var(--space-5)]">
+    <div className="flex min-h-0 flex-1 flex-col gap-[var(--space-5)] overflow-y-auto px-[var(--space-6)] py-[var(--space-5)] [container-type:inline-size] [container-name:voice-profile]">
       <ProfileHeader
         profile={profile}
         isDesign={isDesign}
@@ -279,32 +283,34 @@ export default function VoiceProfile({ voiceId, onBack, onOpenProject, onDeleted
         audioUrl={audioUrl}
         t={t}
       />
-      <ProfileDetails
-        profile={profile}
-        editing={editing}
-        draft={draft}
-        setDraft={setDraft}
-        saving={saving}
-        cancelEdits={cancelEdits}
-        saveEdits={saveEdits}
-        onUnlock={onUnlock}
-        onRevokeConsent={onRevokeConsent}
-        consentStatement={consentStatement}
-        consentRec={consentRec}
-        consentSubmitting={consentSubmitting}
-        t={t}
-      />
-      <ProfileActivity
-        t={t}
-        testText={testText}
-        setTestText={setTestText}
-        testGenerating={testGenerating}
-        runTest={runTest}
-        testAudioUrl={testAudioUrl}
-        autoPlayPreview={autoPlayPreview}
-        usage={usage}
-        onOpenProject={onOpenProject}
-      />
+      <div className="grid items-start gap-[var(--space-6)] @min-[980px]/voice-profile:grid-cols-[minmax(0,1.08fr)_minmax(320px,0.92fr)]">
+        <ProfileDetails
+          profile={profile}
+          editing={editing}
+          draft={draft}
+          setDraft={setDraft}
+          saving={saving}
+          cancelEdits={cancelEdits}
+          saveEdits={saveEdits}
+          onUnlock={onUnlock}
+          onRevokeConsent={onRevokeConsent}
+          consentStatement={consentStatement}
+          consentRec={consentRec}
+          consentSubmitting={consentSubmitting}
+          t={t}
+        />
+        <ProfileActivity
+          t={t}
+          testText={testText}
+          setTestText={setTestText}
+          testGenerating={testGenerating}
+          runTest={runTest}
+          testAudioUrl={testAudioUrl}
+          autoPlayPreview={autoPlayPreview}
+          usage={usage}
+          onOpenProject={onOpenProject}
+        />
+      </div>
     </div>
   );
 }

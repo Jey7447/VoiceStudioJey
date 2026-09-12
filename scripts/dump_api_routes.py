@@ -17,7 +17,7 @@ _REPO = Path(__file__).resolve().parents[1]
 SNAPSHOT = _REPO / "tests" / "fixtures" / "api_routes.txt"
 
 _HEADER = (
-    "# OmniVoice backend API route snapshot — regenerate with "
+    "# VoiceStudio backend API route snapshot — regenerate with "
     "scripts/dump_api_routes.py\n"
     "# Guards against accidental endpoint removal/rename "
     "(tests/test_api_route_inventory.py).\n"
@@ -56,6 +56,9 @@ def route_lines(app):
 def load_app():
     os.environ.setdefault("OMNIVOICE_MODEL", "test")
     os.environ.setdefault("OMNIVOICE_DISABLE_FILE_LOG", "1")
+    # Early-bind refactor: a bare (non-pytest) import defers routers behind
+    # the startup gate — this dump needs the fully-built app at import.
+    os.environ["OMNIVOICE_EAGER_INIT"] = "1"
     sys.path.insert(0, str(_REPO / "backend"))
     from main import app
     return app

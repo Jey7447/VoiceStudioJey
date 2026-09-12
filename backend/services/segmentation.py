@@ -79,6 +79,7 @@ class Segment:
     text: str
     speaker_id: str = "Speaker 1"
     id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    extra: dict = field(default_factory=dict)
 
     @property
     def duration(self) -> float:
@@ -90,12 +91,76 @@ class Segment:
 
     def to_dict(self) -> dict:
         return {
+            **self.extra,
             "id": self.id,
             "start": round(self.start, 2),
             "end": round(self.end, 2),
             "text": self.text,
             "speaker_id": self.speaker_id,
         }
+
+
+def _serialize_words(words: Sequence[Word]) -> list[dict]:
+    """Word objects → the ``{text, start, end}`` dicts persisted on segments.
+
+    Per-word timing is kept on each segment (``Segment.extra["words"]``, so
+    ``to_dict`` carries it onto the job) to drive the karaoke hardsub export.
+    """
+    return [
+        {"text": w.text, "start": round(w.start, 3), "end": round(w.end, 3)}
+        for w in words
+    ]
+
+
+def _merge_segment_extra(target: Segment, incoming: Segment, *, prepend: bool) -> None:
+    """Preserve editor metadata when cleanup folds ``incoming`` into ``target``."""
+    # Word lists must CONCATENATE in text order (the setdefault below would
+    # otherwise adopt the incoming list wholesale when the target has none,
+    # then double it). Capture both sides before setdefault runs.
+    raw_target_words = target.extra.get("words")
+    raw_incoming_words = incoming.extra.get("words")
+    for key, value in incoming.extra.items():
+        target.extra.setdefault(key, value)
+    target_words = raw_target_words if isinstance(raw_target_words, list) else []
+    incoming_words = raw_incoming_words if isinstance(raw_incoming_words, list) else []
+    if target_words or incoming_words:
+        target.extra["words"] = (
+            incoming_words + target_words if prepend else target_words + incoming_words
+        )
+
+    def joined(left: object, right: object) -> str:
+        return _clean(f"{left or ''} {right or ''}")
+
+    target_original = target.extra.get("text_original")
+    incoming_original = incoming.extra.get("text_original")
+    if target_original is not None or incoming_original is not None:
+        target.extra["text_original"] = (
+            joined(incoming_original, target_original)
+            if prepend
+            else joined(target_original, incoming_original)
+        )
+
+    raw_target_translations = target.extra.get("translations")
+    raw_incoming_translations = incoming.extra.get("translations")
+    target_translations = raw_target_translations if isinstance(raw_target_translations, dict) else {}
+    incoming_translations = (
+        raw_incoming_translations if isinstance(raw_incoming_translations, dict) else {}
+    )
+    if target_translations or incoming_translations:
+        merged = {}
+        languages = {
+            *target_translations.keys(),
+            *incoming_translations.keys(),
+        }
+        for language in languages:
+            target_text = target_translations.get(language)
+            incoming_text = incoming_translations.get(language)
+            merged[language] = (
+                joined(incoming_text, target_text)
+                if prepend
+                else joined(target_text, incoming_text)
+            )
+        target.extra["translations"] = merged
 
 
 def _clean(text: str) -> str:
@@ -191,7 +256,10 @@ def _build_segments_from_words(words: Sequence[Word]) -> List[Segment]:
         if not text:
             buf = []
             return
-        segments.append(Segment(start=buf_start, end=buf[-1].end, text=text))
+        segments.append(Segment(
+            start=buf_start, end=buf[-1].end, text=text,
+            extra={"words": _serialize_words(buf)},
+        ))
         buf = []
         if not force:
             buf_start = 0.0
@@ -249,6 +317,7 @@ def _build_segments_from_words(words: Sequence[Word]) -> List[Segment]:
                     start=buf_start,
                     end=left_buf[-1].end,
                     text=_clean(" ".join(x.text for x in left_buf)),
+                    extra={"words": _serialize_words(left_buf)},
                 ))
                 buf = list(right_buf)
                 buf_start = right_buf[0].start
@@ -317,12 +386,14 @@ def _merge_short(segments: List[Segment]) -> List[Segment]:
                 i += 1
                 continue
             if target is prev:
+                _merge_segment_extra(prev, s, prepend=False)
                 prev.text = _clean(prev.text + " " + s.text)
                 prev.end = max(prev.end, s.end)
                 segments.pop(i)
                 did_merge = True
                 continue
             if target is nxt:
+                _merge_segment_extra(nxt, s, prepend=True)
                 nxt.text = _clean(s.text + " " + nxt.text)
                 nxt.start = min(nxt.start, s.start)
                 segments.pop(i)
@@ -360,6 +431,7 @@ def _stitch_adjacent_shorts(segments: List[Segment]) -> List[Segment]:
                 and b.duration <= STITCH_DUR
                 and combined_dur <= MAX_DUR
             ):
+                _merge_segment_extra(a, b, prepend=False)
                 a.text = _clean(a.text + " " + b.text)
                 a.end = b.end
                 segments.pop(i + 1)
@@ -386,6 +458,11 @@ def clean_up_segments(segments: List[dict]) -> List[dict]:
                 text=_clean(str(s.get("text", ""))),
                 speaker_id=str(s.get("speaker_id") or "Speaker 1"),
                 id=str(s.get("id") or uuid.uuid4().hex[:8]),
+                extra={
+                    key: value
+                    for key, value in s.items()
+                    if key not in {"id", "start", "end", "text", "speaker_id"}
+                },
             ))
         except (TypeError, ValueError):
             continue
@@ -429,11 +506,23 @@ def _apply_scene_cuts(segments: List[Segment], scene_cuts: Iterable[float]) -> L
                 or (remaining.end - cut) < MIN_DUR
             ):
                 continue
+            # Segment text is the joined word texts, so a whitespace-boundary
+            # text split maps exactly onto a word-count split of the list.
+            words = remaining.extra.get("words")
+            left_extra: dict = {}
+            right_extra: dict = {}
+            if isinstance(words, list) and words:
+                n_left = len(left_text.split())
+                if n_left and len(words) > n_left:
+                    left_extra = {"words": words[:n_left]}
+                    right_extra = {"words": words[n_left:]}
             out.append(Segment(
                 start=remaining.start, end=cut, text=left_text, speaker_id=remaining.speaker_id,
+                extra=left_extra,
             ))
             remaining = Segment(
                 start=cut, end=remaining.end, text=right_text, speaker_id=remaining.speaker_id,
+                extra=right_extra,
             )
         out.append(remaining)
     return out
@@ -532,14 +621,41 @@ def assign_speakers_from_turns(
     return segments
 
 
-def assign_speakers_heuristic(segments: List[dict]) -> List[dict]:
-    """Two-speaker alternation based on silence gaps."""
-    current = 1
+def assign_speakers_heuristic(
+    segments: List[dict], num_speakers: Optional[int] = None
+) -> List[dict]:
+    """Silence-gap speaker assignment (used when no diarization model runs).
+
+    Base signal: a gap > SPEAKER_GAP seconds between consecutive segments is
+    treated as a speaker change. Without a ``num_speakers`` hint this keeps
+    the legacy behavior — alternate between exactly two labels. With a hint:
+
+    * ``num_speakers=1`` → every segment gets ``"Speaker 1"``.
+    * ``num_speakers>=2`` → labels round-robin across N speakers at each
+      gap boundary, so the user's requested count is represented instead of
+      being silently capped at 2.
+
+    Limits (be honest with callers): this honors the *count*, not voice
+    identity. The rotation order is arbitrary (a returning speaker gets the
+    next label in the cycle, not their own), rapid exchanges with no
+    > SPEAKER_GAP pause still collapse into one label, and N is an upper
+    bound — audio with fewer gap boundaries than N yields fewer labels.
+    Real per-speaker attribution needs pyannote (or an inline-diarizing ASR
+    backend); callers should warn the user accordingly (see dub_core).
+    Invalid hints (non-int, < 1) fall back to the legacy two-speaker cycle.
+    """
+    try:
+        n = int(num_speakers) if num_speakers is not None else 2
+    except (TypeError, ValueError):
+        n = 2
+    if n < 1:
+        n = 2
+    current = 0  # zero-based rotation index; rendered one-based below
     last_end = 0.0
     for i, s in enumerate(segments):
-        if i > 0 and (s["start"] - last_end) > SPEAKER_GAP:
-            current = 2 if current == 1 else 1
-        s["speaker_id"] = f"Speaker {current}"
+        if i > 0 and n > 1 and (s["start"] - last_end) > SPEAKER_GAP:
+            current = (current + 1) % n
+        s["speaker_id"] = f"Speaker {current + 1}"
         last_end = s["end"]
     return segments
 
@@ -638,6 +754,10 @@ def _resplit_core(
             piece["text"] = text
             piece["start"] = s0 if k == 0 else ws[0].start
             piece["end"] = s1 if k == n_runs - 1 else ws[-1].end
+            # dict(seg) copied the WHOLE segment's word list into every piece;
+            # each piece keeps only its own run's words (karaoke burn-in).
+            if "words" in piece:
+                piece["words"] = _serialize_words(ws)
             if label:
                 piece["speaker_id"] = label
             if piece_no > 0:

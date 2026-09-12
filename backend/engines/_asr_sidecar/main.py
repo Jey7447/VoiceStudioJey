@@ -26,6 +26,21 @@ import traceback
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 _model = None
 
+# The parent's cuDNN 8 preload lives in the parent PROCESS, and this is a child
+# with its own clean import path — so without this, an install whose side-loaded
+# cuDNN 8 makes the in-process engine work still had the isolated engine die on
+# every transcribe (#1371). Crash isolation turns that into a failed job rather
+# than a dead backend, which is why it went unnoticed: it fails quietly forever.
+# core.cudnn8 is stdlib-only, so importing it does not undo the cheap-startup
+# rule the module docstring sets out (unlike the heavy `services` package).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+try:
+    from core.cudnn8 import preload as _preload_cudnn8
+
+    _preload_cudnn8()
+except Exception:  # noqa: BLE001 — best-effort; never block the ready handshake
+    pass
+
 
 def _send(stream, obj):
     body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
@@ -70,11 +85,27 @@ def _get_model():
     global _model
     if _model is None:
         from faster_whisper import WhisperModel
-        name = os.environ.get("ASR_MODEL_FW", "large-v3")
+        # Same weights as in-process faster-whisper: ASR_MODEL_FASTER selects
+        # for BOTH variants, ASR_MODEL_FW stays as a sidecar-only override.
+        # Before this, the sidecar read only ASR_MODEL_FW while the download
+        # preflight read ASR_MODEL_FASTER — set one and the other variant (or
+        # the preflight) quietly used a different model.
+        name = (
+            os.environ.get("ASR_MODEL_FW")
+            or os.environ.get("ASR_MODEL_FASTER")
+            or "large-v3"
+        )
         try:
-            import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            # The probe honors the user compute-device override and the
+            # ROCm/CT2 incompatibility (#1529) — the child must agree with
+            # the parent's device decision, not re-derive its own.
+            from core.device_caps import detect_host_caps
+            device = "cuda" if detect_host_caps().family == "cuda" else "cpu"
         except Exception:
+            # Fail SAFE: guessing "cuda" from torch here would bypass a cpu
+            # override and hand CTranslate2 HIP-flavoured cuda on ROCm
+            # (#1529). CPU always works; say why in the sidecar log.
+            print("asr-sidecar: device probe failed — using cpu", file=sys.stderr, flush=True)
             device = "cpu"
         # Degrade fp16 → int8 rather than crash on GPUs without efficient fp16
         # (older Maxwell/Pascal, GTX 16xx, CTranslate2/cuDNN mismatch) (#551).
@@ -114,7 +145,25 @@ def _transcribe(audio_path, word_timestamps):
 
 
 def main() -> int:
-    stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
+    stdin = sys.stdin.buffer
+    # Frames go down a PRIVATE fd, and fd 1 is pointed at stderr (#1428).
+    #
+    # This sidecar's protocol is length-prefixed binary on stdout, but it is
+    # not the only thing writing there: the libraries it loads print freely to
+    # fd 1 — wetextprocessing's FST logs, tqdm bars, native prints from torch
+    # and ONNX runtime. Those bytes interleave with frames, and the parent
+    # then reads four bytes of log text as a length prefix, which is how a
+    # generation dies with `OSError: frame too large: 1044258881` (that number
+    # is ASCII). Worse, it desyncs the stream, so every later request on the
+    # same sidecar reads stale bytes and no retry can recover.
+    #
+    # Duplicating fd 1 first keeps a clean channel only this module can write
+    # to; redirecting fd 1 to fd 2 sends the library noise to stderr, which
+    # the parent already drains into its own log (through the HF-token
+    # redactor). Nothing is lost and the frame stream cannot be corrupted.
+    _frame_fd = os.dup(1)
+    os.dup2(2, 1)
+    stdout = os.fdopen(_frame_fd, "wb")
     _send(stdout, {"op": "ready", "engine": "faster-whisper-isolated"})
     while True:
         try:

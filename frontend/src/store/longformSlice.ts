@@ -7,7 +7,7 @@ import type { StateCreator } from 'zustand';
  *
  * This generalizes the former `storiesSlice`: the persisted field names
  * (`storyProjects`/`storyTracks`/`cast`/`currentProjectId`) are KEPT so every
- * existing consumer and every existing localStorage blob keeps working with no
+ * existing consumer and every legacy persisted envelope keeps working with no
  * change — the project SHAPE gains optional book-identity fields, default-filled
  * on load so older records never surface `undefined` to a controlled input.
  *
@@ -48,6 +48,36 @@ export interface LongformMeta {
   description?: string;
 }
 
+/** Expressive/quality overrides for a longform render (#1208). Every field is
+ *  null/''/false by default — an untouched panel reproduces today's exact
+ *  render on the backend (num_step 32, guidance 2.0, model-default temps,
+ *  postprocess on, no emotion, content-addressed caching). Only non-null values
+ *  are sent, so the request stays backward-compatible. `emoText`/`emoAlpha`
+ *  reach IndexTTS2 only; `varyRepeats` is the cache opt-out. */
+export interface LongformOverrides {
+  numStep: number | null;
+  guidanceScale: number | null;
+  posTemp: number | null;
+  classTemp: number | null;
+  postprocess: boolean | null;
+  seed: number | null;
+  varyRepeats: boolean;
+  emoText: string;
+  emoAlpha: number | null;
+}
+
+export const DEFAULT_OVERRIDES: LongformOverrides = {
+  numStep: null,
+  guidanceScale: null,
+  posTemp: null,
+  classTemp: null,
+  postprocess: null,
+  seed: null,
+  varyRepeats: false,
+  emoText: '',
+  emoAlpha: null,
+};
+
 /** A re-uploadable cover reference. localStorage can't hold the File/blob, so
  *  we persist the picked filename + the server path from POST /audiobook/cover.
  *  serverPath is best-effort (the server may GC the temp cover); a re-picked
@@ -55,6 +85,12 @@ export interface LongformMeta {
 export interface CoverRef {
   filename: string | null;
   serverPath: string | null;
+}
+
+export interface AudiobookRenderChapter {
+  title: string;
+  status: string;
+  duration_s?: number;
 }
 
 interface LongformProject {
@@ -73,10 +109,17 @@ interface LongformProject {
   outputFormat: 'm4b' | 'mp3';
   loudness: 'off' | 'acx' | 'podcast';
   defaultVoice: string | null;
+  language: string;
+  overrides: LongformOverrides;
+  // Audiobook multi-voice cast (#1217): [voice:NAME] → profile id. Empty for a
+  // single-voice book; an absent field on an old record default-fills to {}.
+  voiceCast: Record<string, string>;
   updatedAt: number;
 }
 
 export interface LongformSlice {
+  /** Transient startup gate; never included in the persisted partial state. */
+  longformPersistenceError: boolean;
   // Stories working state (existing field names — consumers unchanged):
   storyTracks: StoryTrack[];
   cast: CastMember[];
@@ -90,6 +133,26 @@ export interface LongformSlice {
   outputFormat: 'm4b' | 'mp3';
   loudness: 'off' | 'acx' | 'podcast';
   defaultVoice: string | null;
+  // Longform render language (#1208 / #505): 'Auto' → the profile's language,
+  // else an explicit pick that reaches the backend (fixes the AudiobookGenerate
+  // body that used to omit `language` entirely).
+  language: string;
+  // Expressive/quality overrides + cache opt-out (#1208). Persisted like the
+  // lexicon so a book's tuning survives a tab switch / reload.
+  overrides: LongformOverrides;
+  // Audiobook cast map (#1217): [voice:NAME] → profile id. Persisted like the
+  // lexicon so a book's voice assignments survive a tab switch / reload.
+  voiceCast: Record<string, string>;
+  // Last finished render's server filename (#1139): the Audiobook tab's
+  // player + Download link used to live in component useState, so a finished
+  // book's export affordance evaporated on the first tab switch and users
+  // reported "no way to download". A server filename (never a blob: URL) is
+  // safe to persist and rehydrate.
+  lastOutput: string;
+  // Render-time inputs for the persisted output. The editable manuscript may
+  // change afterwards; lyrics must continue to follow the audio that exists.
+  lastOutputScript: string;
+  lastOutputChapters: AudiobookRenderChapter[];
   // NB: named `projectMode` (not `mode`) to avoid colliding with the app-level
   // navigation `mode` (uiSlice, AppMode). The stored LongformProject.mode is a
   // nested record field and keeps its name.
@@ -104,12 +167,21 @@ export interface LongformSlice {
   setScript: (script: string) => void;
   setProjectMeta: (patch: Partial<LongformMeta>) => void; // merge (I1)
   setLexicon: (lexicon: Record<string, string>) => void; // replace (I3)
+  setVoiceCast: (name: string, profileId: string | null) => void; // merge/remove
   setOutputPrefs: (patch: {
     outputFormat?: 'm4b' | 'mp3';
     loudness?: 'off' | 'acx' | 'podcast';
     defaultVoice?: string | null;
+    language?: string;
   }) => void; // merge (I2)
+  setLongformOverrides: (patch: Partial<LongformOverrides>) => void; // merge
   setCoverRef: (ref: CoverRef | null) => void;
+  setLastOutput: (output: string) => void;
+  setLastOutputSnapshot: (
+    output: string,
+    script: string,
+    chapters: AudiobookRenderChapter[],
+  ) => void;
   convertMode: (mode: LongformMode) => void; // flips mode only (#24 seam)
   // Project lifecycle:
   saveProject: (name: string) => void;
@@ -133,6 +205,12 @@ export const SLICE_DEFAULTS = {
   outputFormat: 'm4b' as 'm4b' | 'mp3',
   loudness: 'off' as 'off' | 'acx' | 'podcast',
   defaultVoice: null as string | null,
+  language: 'Auto' as string,
+  overrides: DEFAULT_OVERRIDES as LongformOverrides,
+  voiceCast: {} as Record<string, string>,
+  lastOutput: '' as string,
+  lastOutputScript: '' as string,
+  lastOutputChapters: [] as AudiobookRenderChapter[],
   projectMode: 'stories' as LongformMode,
 } as const;
 
@@ -156,6 +234,7 @@ export const createLongformSlice: StateCreator<LongformSlice, [], [], LongformSl
   set,
   get,
 ) => ({
+  longformPersistenceError: false,
   storyTracks: [],
   cast: DEFAULT_CAST.map((c) => ({ ...c })),
   storyProjects: [],
@@ -163,6 +242,8 @@ export const createLongformSlice: StateCreator<LongformSlice, [], [], LongformSl
   ...SLICE_DEFAULTS,
   meta: { ...SLICE_DEFAULTS.meta },
   lexicon: { ...SLICE_DEFAULTS.lexicon },
+  overrides: { ...SLICE_DEFAULTS.overrides },
+  voiceCast: { ...SLICE_DEFAULTS.voiceCast },
 
   setStoryTracks: (storyTracks) => set({ storyTracks }),
   setCast: (cast) => set({ cast }),
@@ -181,14 +262,30 @@ export const createLongformSlice: StateCreator<LongformSlice, [], [], LongformSl
   setScript: (script) => set({ script }),
   setProjectMeta: (patch) => set((s) => ({ meta: { ...s.meta, ...patch } })), // I1 merge
   setLexicon: (lexicon) => set({ lexicon: { ...lexicon } }), // I3 replace
+  setVoiceCast: (name, profileId) =>
+    set((s) => {
+      const next = { ...s.voiceCast };
+      if (profileId) next[name] = profileId;
+      else delete next[name]; // clearing a mapping removes it (→ default voice)
+      return { voiceCast: next };
+    }),
   setOutputPrefs: (patch) =>
     set((s) => ({
       // I2 merge
       outputFormat: patch.outputFormat ?? s.outputFormat,
       loudness: patch.loudness ?? s.loudness,
       defaultVoice: patch.defaultVoice !== undefined ? patch.defaultVoice : s.defaultVoice,
+      language: patch.language ?? s.language,
     })),
+  setLongformOverrides: (patch) => set((s) => ({ overrides: { ...s.overrides, ...patch } })),
   setCoverRef: (coverRef) => set({ coverRef: coverRef ? { ...coverRef } : null }),
+  setLastOutput: (lastOutput) => set({ lastOutput, lastOutputScript: '', lastOutputChapters: [] }),
+  setLastOutputSnapshot: (lastOutput, lastOutputScript, lastOutputChapters) =>
+    set({
+      lastOutput,
+      lastOutputScript,
+      lastOutputChapters: lastOutputChapters.map((chapter) => ({ ...chapter })),
+    }),
   convertMode: (mode) => {
     if (mode !== 'stories' && mode !== 'audiobook') return; // G3
     if (get().projectMode === mode) return; // G2 idempotent
@@ -218,6 +315,9 @@ export const createLongformSlice: StateCreator<LongformSlice, [], [], LongformSl
         outputFormat: s.outputFormat,
         loudness: s.loudness,
         defaultVoice: s.defaultVoice,
+        language: s.language,
+        overrides: { ...s.overrides },
+        voiceCast: { ...s.voiceCast },
         updatedAt: ts,
       };
       const exists = s.storyProjects.some((p) => p.id === id);
@@ -242,6 +342,14 @@ export const createLongformSlice: StateCreator<LongformSlice, [], [], LongformSl
       outputFormat: p.outputFormat ?? SLICE_DEFAULTS.outputFormat,
       loudness: p.loudness ?? SLICE_DEFAULTS.loudness,
       defaultVoice: p.defaultVoice ?? SLICE_DEFAULTS.defaultVoice,
+      language: p.language ?? SLICE_DEFAULTS.language,
+      overrides: { ...SLICE_DEFAULTS.overrides, ...p.overrides },
+      voiceCast: { ...(p.voiceCast ?? SLICE_DEFAULTS.voiceCast) },
+      // A render belongs to the project it was made in — loading another
+      // project must not present A's finished file as B's output (#1139).
+      lastOutput: SLICE_DEFAULTS.lastOutput,
+      lastOutputScript: SLICE_DEFAULTS.lastOutputScript,
+      lastOutputChapters: [...SLICE_DEFAULTS.lastOutputChapters],
       projectMode: p.mode === 'audiobook' ? 'audiobook' : 'stories', // E3 default-safe
       currentProjectId: id,
     });
@@ -254,6 +362,8 @@ export const createLongformSlice: StateCreator<LongformSlice, [], [], LongformSl
       ...SLICE_DEFAULTS,
       meta: { ...SLICE_DEFAULTS.meta },
       lexicon: { ...SLICE_DEFAULTS.lexicon },
+      overrides: { ...SLICE_DEFAULTS.overrides },
+      voiceCast: { ...SLICE_DEFAULTS.voiceCast },
       projectMode: mode === 'audiobook' ? 'audiobook' : 'stories',
       currentProjectId: null,
     }),

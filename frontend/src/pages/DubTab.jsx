@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '../store';
 import { API } from '../api/client';
@@ -13,7 +13,13 @@ import IdleSkeleton from '../components/dub/IdleSkeleton';
 import DubHeader from '../components/dub/DubHeader';
 import DubLeftColumn from '../components/dub/DubLeftColumn';
 import DubRightColumn from '../components/dub/DubRightColumn';
+import DubResizableColumns from '../components/dub/DubResizableColumns';
 import DubFooter from '../components/dub/DubFooter';
+import {
+  hasCompleteTranslation,
+  multiLangTargets,
+  translationProgressByCode,
+} from '../utils/multiLang';
 
 export default function DubTab(props) {
   const { t, i18n } = useTranslation();
@@ -23,6 +29,8 @@ export default function DubTab(props) {
     dubVideoFile,
     dubLocalBlobUrl,
     transcribeElapsed,
+    transcribeProgress,
+    asrInstall,
     translateProvider,
     setTranslateProvider,
     showTranscript,
@@ -37,6 +45,7 @@ export default function DubTab(props) {
     handleDubUpload,
     handleDubIngestUrl,
     handleDubRetryTranscribe,
+    handleInstallMissingAsr,
     handleDubStop,
     handleDubGenerate,
     handleDubImportSrt,
@@ -57,8 +66,10 @@ export default function DubTab(props) {
     segmentEditField,
     segmentDelete,
     segmentRestoreOriginal,
+    pasteTranslations,
     segmentSplit,
     segmentMerge,
+    segmentInsert,
     segmentMoveResize,
     timelineSelSegId,
     setTimelineSelSegId,
@@ -84,7 +95,14 @@ export default function DubTab(props) {
   const dubLang = useAppStore((s) => s.dubLang);
   const setDubLang = useAppStore((s) => s.setDubLang);
   const dubLangCode = useAppStore((s) => s.dubLangCode);
-  const setDubLangCode = useAppStore((s) => s.setDubLangCode);
+  const dubSourceLangCode = useAppStore((s) => s.dubSourceLangCode);
+  const setDubSourceLangCode = useAppStore((s) => s.setDubSourceLangCode);
+  // User-driven language switches go through switchDubLangCode (P1.2): it
+  // swaps segment text through the per-language `translations` map instead
+  // of leaving the previous language's text on screen (and previously,
+  // letting the next translate destroy it). Non-user rehydration paths
+  // (project load, history restore) keep the plain setter.
+  const switchDubLangCode = useAppStore((s) => s.switchDubLangCode);
   const dubNumSpeakers = useAppStore((s) => s.dubNumSpeakers);
   const setDubNumSpeakers = useAppStore((s) => s.setDubNumSpeakers);
   const dubDialect = useAppStore((s) => s.dubDialect);
@@ -106,30 +124,16 @@ export default function DubTab(props) {
   const activeProjectName = useAppStore((s) => s.activeProjectName);
   const translateQuality = useAppStore((s) => s.translateQuality);
   const setTranslateQuality = useAppStore((s) => s.setTranslateQuality);
-  // #372: live LLM availability so the Cinematic toggle can refuse the pick
-  // (instead of looping the user between two warnings). null until loaded.
-  const [llmEndpoint, setLlmEndpoint] = useState(null);
-  useEffect(() => {
-    let cancelled = false;
-    import('../api/client').then(({ apiJson }) =>
-      apiJson('/api/settings/llm-endpoint')
-        .then((d) => {
-          if (!cancelled) setLlmEndpoint(d);
-        })
-        .catch(() => {
-          /* backend mid-boot — guard simply stays permissive */
-        }),
-    );
-    return () => {
-      cancelled = true;
-    };
-  }, []);
   const dualSubs = useAppStore((s) => s.dualSubs);
   const setDualSubs = useAppStore((s) => s.setDualSubs);
   const burnSubs = useAppStore((s) => s.burnSubs);
   const setBurnSubs = useAppStore((s) => s.setBurnSubs);
+  const karaokeSubs = useAppStore((s) => s.karaokeSubs);
+  const setKaraokeSubs = useAppStore((s) => s.setKaraokeSubs);
   const timingStrategy = useAppStore((s) => s.timingStrategy);
   const setTimingStrategy = useAppStore((s) => s.setTimingStrategy);
+  const voiceMatch = useAppStore((s) => s.voiceMatch);
+  const setVoiceMatch = useAppStore((s) => s.setVoiceMatch);
 
   const showIdleSkeleton = !(
     dubJobId &&
@@ -176,31 +180,175 @@ export default function DubTab(props) {
   const [exportOpen, setExportOpen] = useState(false);
   const [qcRunning, setQcRunning] = useState(false);
 
-  // Multi-language mode
-  const [multiLangMode, setMultiLangMode] = useState(false);
-  const [multiLangs, setMultiLangs] = useState([]);
+  // Multi-language mode — store-backed (P1.4) so the picks survive tab
+  // switches and ride the project save/load payload.
+  const multiLangMode = useAppStore((s) => s.multiLangMode);
+  const setMultiLangMode = useAppStore((s) => s.setMultiLangMode);
+  const multiLangs = useAppStore((s) => s.multiLangs);
+  const setMultiLangs = useAppStore((s) => s.setMultiLangs);
+  // The primary target picker and the segment-language switch share the
+  // legacy visible-text slot, but only the picker changes batch membership.
+  const primaryTargetRef = useRef({ lang: dubLang, code: dubLangCode });
+  useEffect(() => {
+    primaryTargetRef.current = { lang: dubLang, code: dubLangCode };
+    // A new backend job starts with the store's restored primary target.
+    // Segment-language switches never change dubJobId and therefore leave it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dubJobId]);
+  const setPrimaryDubLang = useCallback(
+    (lang) => {
+      primaryTargetRef.current = { ...primaryTargetRef.current, lang };
+      setDubLang(lang);
+    },
+    [setDubLang],
+  );
+  const setPrimaryDubLangCode = useCallback(
+    (code) => {
+      primaryTargetRef.current = { ...primaryTargetRef.current, code };
+      switchDubLangCode(code);
+    },
+    [switchDubLangCode],
+  );
+  // The primary target dropdown is part of a multi-language job too. The
+  // chip picker adds extra targets; it does not replace the active one.
+  const batchTargets = useMemo(
+    () =>
+      multiLangTargets(primaryTargetRef.current.lang, primaryTargetRef.current.code, multiLangs),
+    // The store language values intentionally invalidate this memo after a
+    // primary-picker change; segment switches recompute the same ref-backed
+    // target list without changing batch membership.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [dubLang, dubLangCode, multiLangs],
+  );
+  const multiLangProgress = useMemo(
+    () => translationProgressByCode(dubSegments, batchTargets),
+    [batchTargets, dubSegments],
+  );
   // Landing "Advanced" disclosure (pre-upload options).
   const [landingAdvOpen, setLandingAdvOpen] = useState(false);
 
   // Generate CTA — when multi-language mode has picks, dub each language
   // sequentially; every run appends its track to dubbed_tracks, so the
   // preview switcher pills fill up one by one.
+  //
+  // P1.1: each language is TRANSLATED first (`handleTranslateAll(code)`), then
+  // generated — the backend synthesizes segment text verbatim, so without the
+  // translate pass every "multi-language" track rendered the same words.
+  // A pick whose translate fails is skipped (never render a wrong-language
+  // track); the batch continues and the skips are reported at the end.
+  const multiBatchRunningRef = useRef(false);
+  const [multiBatchBusy, setMultiBatchBusy] = useState(false);
   const onGenerateClick = useCallback(async () => {
-    if (multiLangMode && multiLangs.length > 0) {
+    if (multiLangMode && batchTargets.length > 0) {
+      if (multiBatchRunningRef.current) return; // ignore re-clicks mid-batch
+      multiBatchRunningRef.current = true;
+      setMultiBatchBusy(true);
+      const skipped = [];
+      const { lang: primaryLanguage, code: primaryCode } = primaryTargetRef.current;
       try {
-        for (const l of multiLangs) {
-          setDubLang(l.lang);
-          setDubLangCode(l.code); // keep UI/exports in sync
-          // eslint-disable-next-line no-await-in-loop
-          await handleDubGenerate({ langOverride: { language: l.lang, language_code: l.code } });
+        for (let i = 0; i < batchTargets.length; i++) {
+          const l = batchTargets[i];
+          try {
+            setDubLang(l.lang);
+            // Keep UI/exports in sync AND snapshot the previous pick's
+            // translations before this pick's translate pass overwrites the
+            // visible text (P1.2).
+            switchDubLangCode(l.code);
+            // A changed visible text is not proof that it belongs to this
+            // target (switching to an untranslated language intentionally
+            // leaves the previous text visible). Only the per-language map
+            // can safely suppress a redundant translation request.
+            const cached = hasCompleteTranslation(useAppStore.getState().dubSegments, l.code);
+            if (!cached) {
+              // Honest phase label: this pill slot otherwise only says
+              // "Generating…", hiding the translate pass entirely.
+              useAppStore.getState().showPill(
+                'translating',
+                t('dub.multi_translating', {
+                  lang: l.lang,
+                  current: i + 1,
+                  total: batchTargets.length,
+                }),
+                { homeMode: 'dub' },
+              );
+              const ok = await handleTranslateAll(l.code);
+              // Partial translations are useful for manual review, but an
+              // automated batch must never synthesize the untranslated rows
+              // into a mixed-language track.
+              const complete = hasCompleteTranslation(useAppStore.getState().dubSegments, l.code);
+              if (!ok || !complete) {
+                // Error already surfaced by handleTranslateAll (banner/toast);
+                // drop the phase pill and move on to the next language.
+                useAppStore.getState().dismissPill();
+                skipped.push(l.lang);
+                continue;
+              }
+            }
+            await handleDubGenerate({
+              langOverride: { language: l.lang, language_code: l.code },
+            });
+          } catch {
+            // Keep independent target languages moving after one unexpected
+            // failure; the underlying action already surfaces its error.
+            useAppStore.getState().dismissPill();
+            if (!skipped.includes(l.lang)) {
+              skipped.push(l.lang);
+            }
+          }
         }
-      } catch {
-        /* a failed language stops the batch; its error is already surfaced */
+      } finally {
+        setDubLang(primaryLanguage);
+        switchDubLangCode(primaryCode);
+        multiBatchRunningRef.current = false;
+        setMultiBatchBusy(false);
+      }
+      if (skipped.length) {
+        toast.error(t('dub.multi_lang_skipped', { langs: skipped.join(', ') }), {
+          duration: 8000,
+        });
       }
     } else {
       handleDubGenerate();
     }
-  }, [multiLangMode, multiLangs, handleDubGenerate, setDubLang, setDubLangCode]);
+  }, [
+    multiLangMode,
+    batchTargets,
+    handleTranslateAll,
+    handleDubGenerate,
+    setDubLang,
+    switchDubLangCode,
+    t,
+  ]);
+
+  // In multi-language mode, "Translate All" means all configured targets,
+  // while still restoring the primary target in the editor afterwards. Each
+  // translation lands in segments[].translations[code], so Generate can
+  // reuse the complete maps without retranslating or losing another language.
+  const onTranslateClick = useCallback(
+    async (options = {}) => {
+      if (!multiLangMode) return handleTranslateAll(options);
+      if (multiBatchRunningRef.current) return false;
+      multiBatchRunningRef.current = true;
+      setMultiBatchBusy(true);
+      const { lang: primaryLanguage, code: primaryCode } = primaryTargetRef.current;
+      let allOk = true;
+      try {
+        for (const target of batchTargets) {
+          setDubLang(target.lang);
+          switchDubLangCode(target.code);
+          const ok = await handleTranslateAll({ ...options, langOverride: target.code });
+          if (!ok) allOk = false;
+        }
+      } finally {
+        setDubLang(primaryLanguage);
+        switchDubLangCode(primaryCode);
+        multiBatchRunningRef.current = false;
+        setMultiBatchBusy(false);
+      }
+      return allOk;
+    },
+    [multiLangMode, batchTargets, handleTranslateAll, setDubLang, switchDubLangCode],
+  );
 
   // Live ETA while generating — elapsed ticks each second; remaining is
   // extrapolated from the current/total rate so it's only meaningful once
@@ -329,19 +477,71 @@ export default function DubTab(props) {
   // component instead of the global store to avoid polluting cross-project
   // prefs with what's really a per-ingest choice.
   const [fetchYtSubs, setFetchYtSubs] = useState(false);
+  const [youtubeCookieFile, setYoutubeCookieFile] = useState(null);
+  const resetDubAndCredentials = useCallback(() => {
+    setYoutubeCookieFile(null);
+    resetDub?.();
+  }, [resetDub]);
+  const pipelineBusy =
+    isTranslating ||
+    ['uploading', 'installing-asr', 'transcribing', 'generating', 'stopping'].includes(dubStep);
+  const pipelineSteps = pipelineBusy
+    ? []
+    : [
+        ...(dubJobId || dubStep !== 'idle' ? ['upload'] : []),
+        ...(dubVideoFile ? ['prepare'] : []),
+        ...(dubJobId ? ['transcribe'] : []),
+        ...(dubSegments.length ? ['edit'] : []),
+        ...(dubStep === 'done' ? ['export'] : []),
+      ];
+  const onPipelineStep = useCallback(
+    (step) => {
+      if (pipelineBusy) return;
+      if (step === 'upload') {
+        if (dubSegments.length && !window.confirm(`${t('dub.reset')}?`)) return;
+        resetDubAndCredentials();
+      } else if (step === 'prepare' && dubVideoFile) {
+        handleDubUpload?.();
+      } else if (step === 'transcribe' && dubJobId) {
+        const transcriptComplete =
+          dubSegments.length > 0 && ['editing', 'generating', 'done'].includes(dubStep);
+        if (transcriptComplete && !window.confirm(`${t('dub.retry_transcription')}?`)) return;
+        handleDubRetryTranscribe?.();
+      } else if (step === 'edit' && dubSegments.length) {
+        setDubStep('editing');
+      } else if (step === 'export' && dubStep === 'done') {
+        setExportOpen(true);
+      }
+    },
+    [
+      pipelineBusy,
+      dubSegments.length,
+      t,
+      resetDubAndCredentials,
+      dubVideoFile,
+      handleDubUpload,
+      dubJobId,
+      handleDubRetryTranscribe,
+      setDubStep,
+      dubStep,
+    ],
+  );
   const onIngestUrl = () => {
     if (!ingestUrl.trim() || !handleDubIngestUrl) return;
     handleDubIngestUrl(ingestUrl.trim(), {
       fetchSubs: fetchYtSubs,
       subLangs: undefined,
+      cookieFile: youtubeCookieFile || undefined,
     });
     setIngestUrl('');
+    setYoutubeCookieFile(null);
   };
-  const hasDubbedTrack =
-    dubStep === 'done' &&
-    dubLangCode &&
-    dubLangCode !== 'und' &&
-    (dubTracks?.length > 0 || !!dubTracks);
+  // Track-switcher visibility is keyed to the persisted tracks ONLY — not the
+  // language dropdown. Restored projects can carry finished tracks while
+  // dubLangCode reads 'und' (older dub_history rows froze language_code at
+  // ""), and the old `dubLangCode !== 'und'` guard hid their tabs until the
+  // user re-picked a language.
+  const hasDubbedTrack = dubStep === 'done' && dubTracks.length > 0;
   // Cache-busting nonce, bumped every time a generation completes (see
   // useDubWorkflow's done handler). The preview URL is otherwise identical
   // across re-dubs, so the WebView could keep serving the previously
@@ -353,11 +553,23 @@ export default function DubTab(props) {
   const videoSrc = previewIsDub
     ? `${API}/dub/preview-video/${dubJobId}?lang=${encodeURIComponent(previewMode)}&preserve_bg=${preserveBg ? 1 : 0}&v=${dubGenNonce}`
     : `${API}/dub/media/${dubJobId}`;
+  // The video is the normal transport, but WaveSurfer can fall back to a
+  // companion audio element when a WebView decodes the picture without its
+  // audio. Keep that fallback language-aware so a dubbed preview never
+  // silently swaps back to the original track (#1692).
+  const playbackAudioSrc = previewIsDub
+    ? `${API}/dub/download-audio/${dubJobId}?lang=${encodeURIComponent(previewMode)}&preserve_bg=${preserveBg ? 1 : 0}`
+    : `${API}/dub/audio/${dubJobId}`;
   // When a dub finishes, jump the preview to the freshly-dubbed language so the
   // result plays immediately — the user can tap back to Original any time.
+  // Membership guard: only jump to a language that actually has a track,
+  // otherwise fall back to the first track. Restored projects can have
+  // dubLangCode out of sync with the tracks (e.g. 'en'/'und' with tracks
+  // ['bn']) and an unguarded jump would point the player at
+  // /dub/preview-video?lang=en — a guaranteed 404.
   useEffect(() => {
-    if (hasDubbedTrack && previewMode === 'original' && dubLangCode && dubLangCode !== 'und') {
-      setPreviewMode(dubLangCode);
+    if (hasDubbedTrack && previewMode === 'original') {
+      setPreviewMode(dubTracks.includes(dubLangCode) ? dubLangCode : dubTracks[0]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasDubbedTrack, dubLangCode]);
@@ -372,9 +584,16 @@ export default function DubTab(props) {
     try {
       const lang = previewMode !== 'original' ? previewMode : undefined;
       const res = await dubQc(dubJobId, lang);
+      // A generation that finishes while QC is in flight invalidates these
+      // measurements. Ignore the stale response instead of attaching timing
+      // results from the previous audio to the new dub.
+      if (useAppStore.getState().dubGenNonce !== dubGenNonce) {
+        toast.dismiss(loadingId);
+        return;
+      }
       const byId = new Map((res.segments || []).map((q) => [String(q.seg_id), q]));
-      setDubSegments(
-        dubSegments.map((s, i) => {
+      setDubSegments((currentSegments) =>
+        currentSegments.map((s, i) => {
           const q = byId.get(String(s.id ?? i));
           if (!q) return s;
           return {
@@ -418,10 +637,10 @@ export default function DubTab(props) {
     } finally {
       setQcRunning(false);
     }
-  }, [dubJobId, qcRunning, previewMode, dubSegments, setDubSegments, t]);
+  }, [dubJobId, qcRunning, previewMode, dubGenNonce, setDubSegments, t]);
 
   return (
-    <div className="flex-1 flex flex-col min-h-0">
+    <div className="dub-workspace flex-1 flex flex-col min-h-0 min-w-0 [container-type:inline-size] [container-name:dub-shell]">
       {/* Pipeline spine — shown once a file/job is in play so the user always
           knows which stage they're at (Upload → … → Export). In the editor view
           it's inlined onto the DubHeader row (see below), so only render the
@@ -430,11 +649,18 @@ export default function DubTab(props) {
         !(
           dubJobId &&
           (dubStep === 'editing' || dubStep === 'generating' || dubStep === 'done')
-        ) && <DubPipelineStepper dubStep={dubStep} />}
+        ) && (
+          <DubPipelineStepper
+            dubStep={dubStep}
+            selectableSteps={pipelineSteps}
+            onStepSelect={onPipelineStep}
+          />
+        )}
       {/* ── Idle: show full editor skeleton with drop zone ── */}
       {showIdleSkeleton && (
         <IdleSkeleton
           t={t}
+          uiLocale={i18n.language}
           dubVideoFile={dubVideoFile}
           activeProjectName={activeProjectName}
           dubFilename={dubFilename}
@@ -442,6 +668,8 @@ export default function DubTab(props) {
           dubJobId={dubJobId}
           dubStep={dubStep}
           dubFailure={dubFailure}
+          asrInstall={asrInstall}
+          handleInstallMissingAsr={handleInstallMissingAsr}
           handleDubRetryTranscribe={handleDubRetryTranscribe}
           handleDubImportSrt={handleDubImportSrt}
           dubLocalBlobUrl={dubLocalBlobUrl}
@@ -449,6 +677,7 @@ export default function DubTab(props) {
           dubPrepProgress={dubPrepProgress}
           handleDubAbort={handleDubAbort}
           transcribeElapsed={transcribeElapsed}
+          transcribeProgress={transcribeProgress}
           dubDuration={dubDuration}
           dubNumSpeakers={dubNumSpeakers}
           setDubNumSpeakers={setDubNumSpeakers}
@@ -465,19 +694,24 @@ export default function DubTab(props) {
           onIngestUrl={onIngestUrl}
           fetchYtSubs={fetchYtSubs}
           setFetchYtSubs={setFetchYtSubs}
+          youtubeCookieFile={youtubeCookieFile}
+          setYoutubeCookieFile={setYoutubeCookieFile}
           dubLangCode={dubLangCode}
-          setDubLangCode={setDubLangCode}
+          dubSourceLangCode={dubSourceLangCode}
+          setDubSourceLangCode={setDubSourceLangCode}
+          setDubLangCode={switchDubLangCode}
           setDubLang={setDubLang}
           landingAdvOpen={landingAdvOpen}
           setLandingAdvOpen={setLandingAdvOpen}
           dubInstruct={dubInstruct}
           setDubInstruct={setDubInstruct}
+          onOpenQueue={() => useAppStore.getState().setMode?.('batch')}
         />
       )}
 
       {/* ── After transcription: side-by-side editor ── */}
       {dubJobId && (dubStep === 'editing' || dubStep === 'generating' || dubStep === 'done') && (
-        <div className="flex-1 flex flex-col min-h-0">
+        <div className="dub-editor flex-1 flex flex-col min-h-0 min-w-0">
           <DubHeader
             t={t}
             dubFilename={dubFilename}
@@ -485,20 +719,23 @@ export default function DubTab(props) {
             dubSegments={dubSegments}
             activeProjectName={activeProjectName}
             saveProject={saveProject}
-            resetDub={resetDub}
+            resetDub={resetDubAndCredentials}
             dubStep={dubStep}
             handleDubStop={handleDubStop}
             dubProgress={dubProgress}
             onGenerateClick={onGenerateClick}
+            isTranslating={isTranslating}
             multiLangMode={multiLangMode}
-            multiLangs={multiLangs}
+            multiLangs={batchTargets}
             incrementalPlan={incrementalPlan}
             handleDubGenerate={handleDubGenerate}
             qcRunning={qcRunning}
             handleDubQc={handleDubQc}
             setExportOpen={setExportOpen}
+            pipelineSteps={pipelineSteps}
+            onPipelineStep={onPipelineStep}
           />
-          <div className="grid grid-cols-2 max-[1000px]:grid-cols-1 max-[1000px]:grid-rows-[auto_1fr] gap-[6px] flex-1 min-h-0 overflow-hidden">
+          <DubResizableColumns resizeLabel={t('logs.drag_resize')}>
             <DubLeftColumn
               hasDubbedTrack={hasDubbedTrack}
               t={t}
@@ -506,6 +743,7 @@ export default function DubTab(props) {
               setPreviewMode={setPreviewMode}
               dubTracks={dubTracks}
               videoSrc={videoSrc}
+              playbackAudioSrc={playbackAudioSrc}
               waveformRef={waveformRef}
               dubJobId={dubJobId}
               dubSegments={dubSegments}
@@ -533,12 +771,12 @@ export default function DubTab(props) {
               translateProvider={translateProvider}
               dubInstruct={dubInstruct}
               setDubInstruct={setDubInstruct}
-              handleTranslateAll={handleTranslateAll}
+              handleTranslateAll={onTranslateClick}
               isTranslating={isTranslating}
               hasAnyTranslation={hasAnyTranslation}
               handleCleanupSegments={handleCleanupSegments}
-              setDubLang={setDubLang}
-              setDubLangCode={setDubLangCode}
+              setDubLang={setPrimaryDubLang}
+              setDubLangCode={setPrimaryDubLangCode}
               dubDialect={dubDialect}
               setDubDialect={setDubDialect}
               i18n={i18n}
@@ -549,11 +787,11 @@ export default function DubTab(props) {
               engines={engines}
               setTranslateProvider={handleSelectTranslateProvider}
               setTranslateQuality={setTranslateQuality}
-              llmEndpoint={llmEndpoint}
               multiLangMode={multiLangMode}
               setMultiLangMode={setMultiLangMode}
               multiLangs={multiLangs}
               setMultiLangs={setMultiLangs}
+              multiLangProgress={multiLangProgress}
               editSegments={editSegments}
             />
             <DubRightColumn
@@ -567,9 +805,16 @@ export default function DubTab(props) {
               defaultTrack={defaultTrack}
               setDefaultTrack={setDefaultTrack}
               dubLangCode={dubLangCode}
+              multiLangMode={multiLangMode}
+              batchTargets={batchTargets}
+              multiBatchBusy={multiBatchBusy}
+              setDubLang={setDubLang}
+              setDubLangCode={switchDubLangCode}
               dubTracks={dubTracks}
               timingStrategy={timingStrategy}
               setTimingStrategy={setTimingStrategy}
+              voiceMatch={voiceMatch}
+              setVoiceMatch={setVoiceMatch}
               dubTranscript={dubTranscript}
               showTranscript={showTranscript}
               setShowTranscript={setShowTranscript}
@@ -598,20 +843,24 @@ export default function DubTab(props) {
               segmentEditField={segmentEditField}
               segmentDelete={segmentDelete}
               segmentRestoreOriginal={segmentRestoreOriginal}
+              pasteTranslations={pasteTranslations}
               handleSegmentPreview={handleSegmentPreview}
               onDirectSegment={onDirectSegment}
               segmentSplit={segmentSplit}
               segmentMerge={segmentMerge}
+              segmentInsert={segmentInsert}
+              segmentMoveResize={segmentMoveResize}
               seekWaveform={seekWaveform}
               timelineSelSegId={timelineSelSegId}
               dubStep={dubStep}
               dubProgress={dubProgress}
             />
-          </div>
+          </DubResizableColumns>
           <DubFooter
             t={t}
             dubStep={dubStep}
             dubTracks={dubTracks}
+            dubLangCode={dubLangCode}
             incrementalPlan={incrementalPlan}
             dubError={dubError}
             dubFailure={dubFailure}
@@ -641,6 +890,8 @@ export default function DubTab(props) {
         setDualSubs={setDualSubs}
         burnSubs={burnSubs}
         setBurnSubs={setBurnSubs}
+        karaokeSubs={karaokeSubs}
+        setKaraokeSubs={setKaraokeSubs}
         API={API}
         triggerDownload={triggerDownload}
         handleDubDownload={handleDubDownload}

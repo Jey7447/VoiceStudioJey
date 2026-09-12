@@ -1,6 +1,15 @@
 # Engine venvs & disk usage
 
-Most engines run in-process in OmniVoice's main environment. A few
+The Model Catalogue now exposes a structured disk breakdown before install:
+model-weight download, package download, unique installed bytes, potentially
+shared bytes, temporary free-space requirement, destination volume, and the
+estimate confidence. Missing package or deduplication measurements are shown as
+unknown rather than zero. Opening an installed engine's disk details measures
+its model, environment, shared cache, and app-owned total separately. These
+values come from `config/models.yaml` and the sidecar installer specification;
+the UI does not maintain its own size table.
+
+Most engines run in-process in VoiceStudio's main environment. A few
 (**IndexTTS2**, **MOSS-TTS-v1.5**, **dots.tts**, and any engine whose
 dependencies conflict with the parent's `torch`/`transformers` pins) run in a
 **dedicated sidecar venv** so their pins can't break the rest of the app. Those
@@ -9,7 +18,7 @@ cost is kept down.
 
 ## Why a sidecar needs its own venv
 
-IndexTTS2 pins `transformers<5`, but OmniVoice requires `transformers>=5.3`.
+IndexTTS2 pins `transformers<5`, but VoiceStudio requires `transformers>=5.3`.
 You can't have both in one environment, so IndexTTS2 gets its own venv created
 on first use (`uv venv` + `uv pip install`, see
 `backend/engines/indextts/bootstrap.py`). The cost is a second copy of the
@@ -64,7 +73,12 @@ running an 8B model whose stack pins `transformers==5.0`).
 ## Practical guidance
 
 - Keep `UV_CACHE_DIR` and the engine venvs on one filesystem (the default —
-  both under your home dir — already satisfies this).
+  both under your home dir — already satisfies this). **The app enforces this
+  automatically**: when the app env or the engine venvs live on a different
+  volume than uv's default cache (D:-drive install, portable mode), every
+  managed `uv` invocation gets `UV_CACHE_DIR` pointed at a cache next to the
+  venvs (`<env root>/uv-cache`, `<data dir>/engines/.uv-cache`). An explicit
+  `UV_CACHE_DIR` you set yourself always wins.
 - On Linux ext4 (no reflink), `export UV_LINK_MODE=hardlink` guarantees dedup
   on any single filesystem; the default `clone` only dedupes on
   reflink-capable filesystems (XFS-with-reflink, btrfs, APFS).

@@ -51,6 +51,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -97,6 +98,7 @@ def _platform_slug() -> str:
         darwin-x86_64
         windows-x86_64
         linux-x86_64
+        linux-aarch64
     """
     system = platform.system().lower()
     machine = platform.machine().lower()
@@ -106,6 +108,8 @@ def _platform_slug() -> str:
         return "darwin-x86_64"
     if system == "windows":
         return "windows-x86_64"
+    if system == "linux" and machine in ("arm64", "aarch64"):
+        return "linux-aarch64"
     # Linux + everything else falls into the linux slug.
     return "linux-x86_64"
 
@@ -117,6 +121,63 @@ def _binary_path(slug: Optional[str] = None) -> Path:
     if s.startswith("windows"):
         name += ".exe"
     return _REPO_ROOT / "bin" / name
+
+
+def _generate_timeout_s() -> float:
+    """Hard per-spawn timeout for the C++ binary, read from the env at call time.
+
+    ``OMNIVOICE_GGUF_GENERATE_TIMEOUT_S`` overrides; the default sits ABOVE
+    the GPU-pool generate budget (``OMNIVOICE_GENERATE_TIMEOUT_S``, 300s
+    floor) on purpose — the pool guard is the real, well-diagnosed deadline,
+    and this one only reaps a truly wedged C++ process. The old hardcoded
+    120s killed legitimate CPU-only generates mid-synthesis (#1348).
+    """
+    raw = os.environ.get("OMNIVOICE_GGUF_GENERATE_TIMEOUT_S")
+    if raw:
+        try:
+            val = float(raw)
+        except ValueError:
+            val = None
+        # inf would disarm the wedge guard entirely; nan poisons max().
+        if val is not None and math.isfinite(val):
+            return max(1.0, val)
+        logger.warning(
+            "Ignoring invalid OMNIVOICE_GGUF_GENERATE_TIMEOUT_S=%r", raw
+        )
+    return 600.0
+
+
+def _spawn_env() -> dict[str, str]:
+    """Environment for spawning the binary, with ``bin/`` on the loader path.
+
+    A source-built binary can be dynamically linked against the ``libggml*``
+    shared libraries the build script now drops next to it; without the
+    loader path the spawn dies with exit 127 — ``libggml.so.0: cannot open
+    shared object file`` (#1348). Windows resolves DLLs from the exe's own
+    directory already; Linux and macOS need it stated. Both variables are
+    set unconditionally — each OS ignores the other's.
+    """
+    env = os.environ.copy()
+    bin_dir = str(_binary_path().parent)
+    for var in ("LD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"):
+        prev = env.get(var)
+        env[var] = bin_dir if not prev else bin_dir + os.pathsep + prev
+    return env
+
+
+def _binary_repair_hint() -> str:
+    """One actionable sentence for a broken/placeholder GGUF binary (#1172).
+
+    Appended to every InvalidBinaryError this engine raises so the user
+    always learns what to do, whether the failure surfaced from preflight
+    or from the OS at exec time.
+    """
+    return (
+        f"the bundled GGUF runtime is not usable on this machine — build it "
+        f"with `scripts/build-omnivoice-tts.sh --platform {_platform_slug()}`, "
+        f"reinstall VoiceStudio, or switch to the default in-process "
+        f"OmniVoice engine (Model Catalogue → Engines)"
+    )
 
 
 def _load_quant_map() -> dict:
@@ -295,12 +356,13 @@ def _make_backend_class():
         display_name = "OmniVoice (GGUF, hardware-adaptive)"
         gpu_compat = ("cuda", "mps", "cpu")
         supports_voice_design = False
+        # Every generate() spawns the external binary — allocations live in
+        # that process, invisible to parent-side accelerator counters.
+        runs_out_of_process = True
 
         # 24 kHz mono Higgs Audio v2 — same as the in-process OmniVoice.
         _SAMPLE_RATE = 24_000
 
-        # Default per-call timeout matches the SubprocessBackend contract.
-        _GENERATE_TIMEOUT_S = 120.0
         # Quick probe at startup to confirm the binary spawns at all.
         _PROBE_TIMEOUT_S = 5.0
 
@@ -332,6 +394,26 @@ def _make_backend_class():
                         f"this build does not bundle the runtime for "
                         f"{_platform_slug()}. Fall back to OmniVoice in-process."
                     )
+                # #1172: a source checkout ships zero-byte placeholders in
+                # bin/ (real binaries come from CI / the installer), and the
+                # checksum manifest is absent there — so without this check a
+                # placeholder passed as "ready", got chmod +x'd by the #437
+                # self-heal below, and died at spawn time with a bare
+                # "[Errno 8] Exec format error" 500. Validate BEFORE the
+                # checksum/quarantine/exec-bit steps so we never bless (or
+                # chmod) a file that isn't a real executable.
+                from services.binary_preflight import looks_like_executable
+                bin_ok, bin_why = looks_like_executable(bin_path)
+                if not bin_ok:
+                    return False, (
+                        f"GGUF binary {bin_path.name} is not a usable "
+                        f"executable: {bin_why}. Source checkouts ship "
+                        f"zero-byte placeholders until a real binary is "
+                        f"built — run `scripts/build-omnivoice-tts.sh "
+                        f"--platform {_platform_slug()}`, reinstall "
+                        f"VoiceStudio, or use the default in-process "
+                        f"OmniVoice engine (Model Catalogue → Engines)."
+                    )
                 # Manifest-based SHA-256 verification (T-04-01).
                 manifest = _load_checksum_manifest()
                 expected = manifest.get(bin_path.name)
@@ -349,7 +431,7 @@ def _make_backend_class():
                     return False, (
                         f"GGUF binary {bin_path.name} is quarantined by "
                         f"macOS Gatekeeper. Run:\n\n"
-                        f"    xattr -cr '/Applications/OmniVoice Studio.app'\n\n"
+                        f"    xattr -cr '/Applications/VoiceStudio.app'\n\n"
                         f"This clears the quarantine on the .app and its "
                         f"bundled binaries. See docs/install/macos.md."
                     )
@@ -483,11 +565,22 @@ def _make_backend_class():
                     capture_output=True,
                     timeout=timeout,
                     check=False,
+                    env=_spawn_env(),
                 )
             except FileNotFoundError:
                 raise
             except subprocess.TimeoutExpired:
                 raise
+            except OSError as exc:
+                # ENOEXEC / EACCES etc. — the file exists but the OS refused
+                # to exec it (#1172 class: placeholder or wrong-arch binary
+                # that slipped past preflight). Typed + actionable, never a
+                # bare errno.
+                from services.binary_preflight import InvalidBinaryError
+                raise InvalidBinaryError(
+                    bin_path, f"the OS refused to execute it ({exc})",
+                    _binary_repair_hint(),
+                ) from exc
             # `--help` typically exits 0 or 1 (some CLIs use 1 to signal
             # "help shown, no work done"). We accept both as long as the
             # binary actually emitted something.
@@ -663,19 +756,38 @@ def _make_backend_class():
             Never uses ``shell=True``. Stderr is captured and HF-token-redacted
             before being logged at warning level.
             """
+            # #1172 class: validate the binary immediately before exec (the
+            # engine may have been selected explicitly, bypassing
+            # is_available; or the file changed since the last probe). A
+            # placeholder/corrupt binary raises the typed, actionable
+            # InvalidBinaryError instead of "[Errno 8] Exec format error".
+            from services.binary_preflight import (
+                InvalidBinaryError,
+                validate_executable,
+            )
+            validate_executable(Path(argv[0]), hint=_binary_repair_hint())
+            timeout_s = _generate_timeout_s()
             try:
                 proc = subprocess.run(
                     argv,
                     input=stdin_text,
                     text=True,
                     capture_output=True,
-                    timeout=self._GENERATE_TIMEOUT_S,
+                    timeout=timeout_s,
                     check=False,
+                    env=_spawn_env(),
                 )
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError(
                     f"GGUF subprocess timed out after "
-                    f"{self._GENERATE_TIMEOUT_S:.0f}s (T-04-06)"
+                    f"{timeout_s:.0f}s (T-04-06; raise "
+                    f"OMNIVOICE_GGUF_GENERATE_TIMEOUT_S if this host is "
+                    f"genuinely that slow)"
+                ) from exc
+            except OSError as exc:
+                raise InvalidBinaryError(
+                    argv[0], f"the OS refused to execute it ({exc})",
+                    _binary_repair_hint(),
                 ) from exc
 
             if proc.returncode != 0:
@@ -749,7 +861,7 @@ def select_default_engine() -> str:
     Returns ``"omnivoice"`` (the existing in-process default) on any
     failure. The fallback is deliberately silent — a user who hits this
     code path still gets a working cloning engine; the failure surfaces
-    in the Settings → Engines Compatibility Matrix (Plan 02-04) so the
+    in the Model Catalogue → Engines Compatibility Matrix (Plan 02-04) so the
     user can investigate if they care to.
     """
     cls = _make_backend_class()

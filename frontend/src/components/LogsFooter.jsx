@@ -14,16 +14,28 @@ import {
   FileText,
   Heart,
   Mail,
+  Sparkles,
+  Braces,
+  Gem,
 } from 'lucide-react';
 
 import toast from 'react-hot-toast';
 import { clearSystemLogs, clearTauriLogs } from '../api/system';
-import { useSystemLogs, useTauriLogs, useNotifications } from '../api/hooks';
+import {
+  useSystemLogs,
+  useTauriLogs,
+  useVisibleNotifications,
+  isDismissibleNotification,
+} from '../api/hooks';
 import { getFrontendLogs, clearFrontendLogs } from '../utils/consoleBuffer';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '../store';
 import NetworkToggle from './NetworkToggle';
-import { APP_VERSION } from '../utils/appVersion';
+import ComputeQuickSettings from './ComputeQuickSettings';
+import EngineQuickSwitch from './EngineQuickSwitch';
+import { APP_VERSION, whatsNewPending } from '../utils/appVersion';
+import DonateMomentPopover, { DONATE_POPOVER_AUTO_DISMISS_MS } from './DonateMomentPopover';
+import { DONATION_MOMENT_EVENT, optOutOfDonationMoments } from '../utils/donationMoments';
 
 /**
  * VSCode-style bottom panel for logs. Always-visible 28 px collapsed bar
@@ -128,13 +140,25 @@ const DISCORD_BTN =
   'rounded-[4px] bg-transparent border-0 cursor-pointer [color:#7289da] opacity-60 ' +
   'transition-[color,opacity,transform] duration-150 hover:opacity-100 hover:[color:#5865F2] hover:scale-110';
 
+// API-reference button: same compact footer-icon shell as Discord/Mail but on
+// the neutral chrome-muted palette, hovering to the theme accent.
+const API_REF_BTN =
+  'flex items-center justify-center w-[var(--chrome-icon-btn)] h-[var(--chrome-icon-btn)] shrink-0 ' +
+  'rounded-[4px] bg-transparent border-0 cursor-pointer [color:var(--chrome-fg-muted)] opacity-70 ' +
+  'transition-[color,opacity,transform] duration-150 hover:opacity-100 hover:[color:var(--chrome-accent)] hover:scale-110';
+
 const DONATE_BTN =
   'flex items-center justify-center w-[var(--chrome-icon-btn)] h-[var(--chrome-icon-btn)] shrink-0 ' +
-  'rounded-[4px] bg-transparent border-0 cursor-pointer [color:#d3869b] ml-[4px] ' +
-  'transition-[color,transform] duration-150 hover:[color:var(--chrome-accent)] hover:scale-[1.15] ' +
+  'rounded-[4px] bg-transparent border-0 cursor-pointer [color:#d3869b] ' +
+  'transition-[color,transform] duration-150 hover:[color:var(--chrome-accent)] hover:scale-[1.15]';
+// Idle glow vs. the gentle attention pulse while the donation-moment popover
+// is open. Split from DONATE_BTN so exactly one animation applies at a time.
+const HEART_GLOW =
   '[animation:heart-glow_2.5s_ease-in-out_infinite] motion-reduce:[animation:none]';
+const HEART_PULSE =
+  '[animation:donate-heart-pulse_1.1s_ease-in-out_infinite] motion-reduce:[animation:none]';
 
-function SourcePill({ source, counts, active, onClick }) {
+function SourcePill({ source, counts, active, onClick, icon: Icon }) {
   const hasErrors = counts.error > 0;
   const hasWarns = counts.warn > 0;
   // Severity color wins over active wins over muted (matches old cascade).
@@ -155,6 +179,7 @@ function SourcePill({ source, counts, active, onClick }) {
       onClick={onClick}
       aria-label={`${source.label} logs${hasErrors ? `, ${counts.error} errors` : hasWarns ? `, ${counts.warn} warnings` : ''}`}
     >
+      {Icon && <Icon size={12} className="shrink-0" aria-hidden="true" />}
       <span className="font-medium">{source.label}</span>
       {hasErrors && <span className={BADGE_ERROR}>{counts.error}</span>}
       {!hasErrors && hasWarns && <span className={BADGE_WARN}>{counts.warn}</span>}
@@ -208,6 +233,21 @@ export default function LogsFooter() {
   const updateStatus = useAppStore((s) => s.updateStatus);
   const updateVersion = useAppStore((s) => s.updateVersion);
   const updateReady = updateStatus === 'available' || updateStatus === 'ready';
+  // One-time "What's new" affordance after an update (feat/safe-updates):
+  // non-blocking footer pill, never a startup modal. First run with no
+  // recorded version baselines silently; after an update the pill shows
+  // until the user opens the notes (or clicks it away).
+  const whatsNewSeen = useAppStore((s) => s.whatsNewSeenVersion);
+  useEffect(() => {
+    if (whatsNewSeen == null && APP_VERSION !== 'unknown') {
+      useAppStore.getState().setWhatsNewSeenVersion(APP_VERSION);
+    }
+  }, [whatsNewSeen]);
+  const showWhatsNew = whatsNewPending(whatsNewSeen, APP_VERSION);
+  const openWhatsNew = useCallback(() => {
+    useAppStore.getState().setWhatsNewSeenVersion(APP_VERSION);
+    useAppStore.getState().openSettingsTab?.('updates');
+  }, []);
   const [height, setHeight] = useState(() => {
     const v = Number(localStorage.getItem(LS_HEIGHT));
     return Number.isFinite(v) && v >= MIN_H && v <= MAX_H ? v : 300;
@@ -226,10 +266,11 @@ export default function LogsFooter() {
   useEffect(() => localStorage.setItem(LS_HEIGHT, String(height)), [height]);
   useEffect(() => localStorage.setItem(LS_ACTIVE, active), [active]);
 
-  // Expose the current footer height as a CSS variable on :root so the
-  // studio's .app-container grid + the setup-wizard wrapper both shrink
-  // by exactly the right amount. Keeps sidebar + main content out from
-  // under the expanded panel without any JS-driven layout math.
+  // Expose the current footer height as a CSS variable on :root. Inside the
+  // studio shell the footer is a grid ROW (index.css .app-container), so
+  // content clearance needs no variable — but the fixed toasts/previews that
+  // anchor above the footer (VoicePreview, ExportModal, …) and the
+  // setup-wizard wrapper still position off --logs-footer-height.
   useEffect(() => {
     const h = collapsed ? 28 : height;
     document.documentElement.style.setProperty('--logs-footer-height', `${h}px`);
@@ -289,8 +330,25 @@ export default function LogsFooter() {
   }, [pullFrontend, collapsed]);
 
   // ── Notifications (shared TanStack Query cache with the header bell) ────
-  const notifQuery = useNotifications();
-  const notifications = notifQuery.data?.notifications || [];
+  // Already filtered to what the user hasn't dismissed — badge and tab agree.
+  const { notifications } = useVisibleNotifications();
+  const dismissNotification = useAppStore((s) => s.dismissNotification);
+
+  // ── Donation moment popover (see utils/donationMoments.js) ─────────────
+  // The eligibility engine dispatches DONATION_MOMENT_EVENT after a rare,
+  // gated value-creation success; the footer just renders the speech bubble
+  // above the heart and auto-dismisses it. null = closed.
+  const [donateMoment, setDonateMoment] = useState(null);
+  useEffect(() => {
+    const onMoment = (e) => setDonateMoment({ line: e?.detail?.line ?? 0 });
+    window.addEventListener(DONATION_MOMENT_EVENT, onMoment);
+    return () => window.removeEventListener(DONATION_MOMENT_EVENT, onMoment);
+  }, []);
+  useEffect(() => {
+    if (!donateMoment) return undefined;
+    const timer = setTimeout(() => setDonateMoment(null), DONATE_POPOVER_AUTO_DISMISS_MS);
+    return () => clearTimeout(timer);
+  }, [donateMoment]);
 
   // Allow header bell to open notifications tab
   useEffect(() => {
@@ -389,7 +447,7 @@ export default function LogsFooter() {
     // + user agent — onto the clipboard so the user can paste into a
     // GitHub issue without hand-collecting files.
     const header = [
-      `OmniVoice Studio — diagnostic report`,
+      `VoiceStudio — diagnostic report`,
       `When: ${new Date().toISOString()}`,
       `UA: ${navigator.userAgent}`,
       `Counts: backend err=${counts.backend.error}/warn=${counts.backend.warn}, ` +
@@ -451,6 +509,7 @@ export default function LogsFooter() {
                Expanding reveals the per-source filter tabs below. */
             <SourcePill
               source={{ id: 'logs', label: t('logs.title') }}
+              icon={FileText}
               counts={mergedCounts}
               active={false}
               onClick={() => openTo(SOURCES.some((s) => s.id === active) ? active : 'backend')}
@@ -518,6 +577,29 @@ export default function LogsFooter() {
               </button>
             </div>
           )}
+          {showWhatsNew && (
+            <button
+              type="button"
+              data-testid="whats-new-pill"
+              className={
+                'shrink-0 inline-flex items-center gap-[4px] px-[7px] h-[var(--chrome-icon-btn)] rounded-[999px] cursor-pointer ' +
+                'text-[10px] tracking-[0.02em] border border-[color:var(--chrome-accent)] bg-transparent ' +
+                '[color:var(--chrome-accent)] hover:opacity-80 transition-opacity duration-150'
+              }
+              onClick={openWhatsNew}
+              title={t('updates.whats_new_in', {
+                version: APP_VERSION,
+                defaultValue: "What's new in v{{version}}",
+              })}
+              aria-label={t('updates.whats_new_in', {
+                version: APP_VERSION,
+                defaultValue: "What's new in v{{version}}",
+              })}
+            >
+              <Sparkles size={11} aria-hidden="true" />
+              {t('update.whats_new', { defaultValue: "What's new" })}
+            </button>
+          )}
           <button
             type="button"
             className={
@@ -557,7 +639,18 @@ export default function LogsFooter() {
               />
             )}
           </button>
+          <ComputeQuickSettings />
+          <EngineQuickSwitch shortcutTarget dropUp />
           <NetworkToggle />
+          <button
+            type="button"
+            className={API_REF_BTN}
+            onClick={() => useAppStore.getState().openSettingsTab?.('openapi')}
+            title={t('logs.open_api', { defaultValue: 'API reference' })}
+            aria-label={t('logs.open_api_aria', { defaultValue: 'Open the OpenAPI reference' })}
+          >
+            <Braces size={14} aria-hidden="true" />
+          </button>
           <button
             type="button"
             className={DISCORD_BTN}
@@ -582,15 +675,55 @@ export default function LogsFooter() {
           >
             <Mail size={14} />
           </button>
+          {/* Sponsors — a compact link (never a logo strip in the 28px bar).
+              Opens the Support page, whose Sponsors section holds the logo
+              grid + "Become a sponsor" affordance. */}
           <button
             type="button"
-            className={DONATE_BTN}
+            className={
+              'shrink-0 inline-flex items-center gap-[4px] px-[7px] h-[var(--chrome-icon-btn)] rounded-[4px] ' +
+              'bg-transparent border-0 cursor-pointer text-[11px] tracking-[0.02em] ' +
+              '[color:var(--chrome-fg-muted)] transition-[color,opacity] duration-150 ' +
+              'hover:[color:var(--chrome-accent)]'
+            }
             onClick={() => useAppStore.getState().setMode?.('donate')}
-            title={t('logs.support_project')}
-            aria-label={t('logs.support_project_aria')}
+            title={t('logs.sponsors', { defaultValue: 'Sponsors' })}
+            aria-label={t('logs.sponsors_aria', {
+              defaultValue: 'View sponsors and support the project',
+            })}
           >
-            <DonateHeart />
+            <Gem size={12} aria-hidden="true" />
+            {t('logs.sponsors', { defaultValue: 'Sponsors' })}
           </button>
+          <div className="relative inline-flex shrink-0 ml-[4px]">
+            <button
+              type="button"
+              className={`${DONATE_BTN} ${donateMoment ? HEART_PULSE : HEART_GLOW}`}
+              onClick={() => {
+                // Manual entry is unchanged: the heart always opens the full
+                // donate view (and quietly retires an open popover).
+                setDonateMoment(null);
+                useAppStore.getState().setMode?.('donate');
+              }}
+              title={t('logs.support_project')}
+              aria-label={t('logs.support_project_aria')}
+            >
+              <DonateHeart />
+            </button>
+            {donateMoment && (
+              <DonateMomentPopover
+                line={donateMoment.line}
+                onLater={() => setDonateMoment(null)}
+                onOptOut={() => {
+                  optOutOfDonationMoments();
+                  // Mirror into the legacy postcard flag so both engines stay
+                  // permanently silenced no matter which one is wired.
+                  useAppStore.getState().optOutOfDonation?.();
+                  setDonateMoment(null);
+                }}
+              />
+            )}
+          </div>
         </div>
       </div>
 
@@ -672,8 +805,22 @@ export default function LogsFooter() {
                         .then(({ apiFetch }) => apiFetch('/system/crash/ack', { method: 'POST' }))
                         .catch(() => {});
                     }
+                    // Same contract for the run-sentinel notice (#1164):
+                    // acting on it watermarks the record server-side, so it
+                    // stops re-firing — a NEW unclean death re-arms (its id
+                    // carries a fresh detected_at).
+                    if (notif.id?.startsWith('last-run-crash-')) {
+                      import('../api/client')
+                        .then(({ apiFetch }) =>
+                          apiFetch('/system/last-run-crash/ack', { method: 'POST' }),
+                        )
+                        .catch(() => {});
+                    }
                     if (notif.action.type === 'navigate') {
                       useAppStore.getState().setMode?.(notif.action.target);
+                      setCollapsed(true);
+                    } else if (notif.action.type === 'settings-tab') {
+                      useAppStore.getState().openSettingsTab?.(notif.action.target);
                       setCollapsed(true);
                     } else if (notif.action.type === 'link') {
                       import('../api/external').then((m) => m.openExternal(notif.action.target));
@@ -693,6 +840,20 @@ export default function LogsFooter() {
                     <span className="shrink-0 text-[11px] font-semibold text-brand whitespace-nowrap">
                       {notif.action.label} →
                     </span>
+                  )}
+                  {isDismissibleNotification(notif) && notif.id && (
+                    <button
+                      className="shrink-0 flex h-[18px] w-[18px] cursor-pointer items-center justify-center rounded border-0 bg-transparent p-0 text-fg-muted transition-colors hover:text-fg hover:[background:rgba(255,255,255,0.08)]"
+                      onClick={(e) => {
+                        // The row itself may navigate; hiding must not.
+                        e.stopPropagation();
+                        dismissNotification(notif.id);
+                      }}
+                      aria-label={t('common.dismiss')}
+                      title={t('common.dismiss')}
+                    >
+                      <X size={11} />
+                    </button>
                   )}
                 </div>
               );

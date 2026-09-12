@@ -11,16 +11,21 @@ import {
   tasksCancel,
   transcribeStreamUrl,
   dubImportSrt,
+  DUB_COOKIE_TRANSPORT_ERROR,
+  DUB_COOKIE_SIZE_ERROR,
 } from '../api/dub';
 import { dialectMatchesLang } from '../api/dialects';
 import { segmentGenInputs, applySpeakerCloneDefaults } from '../utils/segments';
 import { apiPost, apiFetch } from '../api/client';
 import { API } from '../api/client';
+import { streamDropError } from '../utils/backendCrash';
 import { playPing } from '../utils/media';
 import { toast } from 'react-hot-toast';
 import { toastErrorWithReport } from '../utils/errorToast';
+import { asrMissingPayload, installRecommendedAsr } from '../utils/asrModelMissing';
+import { cancelInstallModel } from '../api/setup';
 import { addBreadcrumb } from '../utils/breadcrumbs';
-import { evaluateDonationPrompt } from '../components/donate/evaluateDonationPrompt';
+import { recordValueMoment } from '../utils/donationMoments';
 import i18next from 'i18next';
 const t = i18next.t.bind(i18next);
 
@@ -44,6 +49,18 @@ export function isExpiredDubJobError(err) {
   );
 }
 
+export function shouldQueueSrtImport(dubStep, sourceAnalysisComplete = false) {
+  return !sourceAnalysisComplete && ['uploading', 'transcribing'].includes(dubStep);
+}
+
+export async function applyQueuedSrtImport(pendingRef, jobId, signal, performImport) {
+  const file = pendingRef.current;
+  if (!file) return false;
+  const imported = await performImport(jobId, file, signal);
+  if (imported && pendingRef.current === file) pendingRef.current = null;
+  return imported;
+}
+
 /**
  * Encapsulates the entire dub pipeline workflow:
  *   upload → prep → transcribe → translate → generate → export
@@ -64,6 +81,7 @@ export default function useDubWorkflow({
   const setDubSegments = useAppStore((s) => s.setDubSegments);
   const dubLang = useAppStore((s) => s.dubLang);
   const dubLangCode = useAppStore((s) => s.dubLangCode);
+  const dubSourceLangCode = useAppStore((s) => s.dubSourceLangCode);
   const dubInstruct = useAppStore((s) => s.dubInstruct);
   const setDubFilename = useAppStore((s) => s.setDubFilename);
   const setDubDuration = useAppStore((s) => s.setDubDuration);
@@ -83,8 +101,10 @@ export default function useDubWorkflow({
   const cfg = useAppStore((s) => s.cfg);
   const speed = useAppStore((s) => s.speed);
   const translateQuality = useAppStore((s) => s.translateQuality);
+  const condenseSuggest = useAppStore((s) => s.condenseSuggest);
   const timingStrategy = useAppStore((s) => s.timingStrategy);
   const fitOptions = useAppStore((s) => s.fitOptions);
+  const voiceMatch = useAppStore((s) => s.voiceMatch);
   const glossaryTerms = useAppStore((s) => s.glossaryTerms);
   const dubDialect = useAppStore((s) => s.dubDialect);
 
@@ -93,18 +113,103 @@ export default function useDubWorkflow({
   const [previewAudios, setPreviewAudios] = useState({});
   const [transcribeStart, setTranscribeStart] = useState(null);
   const [transcribeElapsed, setTranscribeElapsed] = useState(0);
+  // Real fraction of chunks transcribed, straight from the backend's `segments`
+  // events. The overlay used to *invent* an ETA from the video's duration
+  // instead (#1127) — it assumed ~20x-realtime transcription, which is roughly
+  // true on a CUDA GPU and 50x wrong on a CPU, so it showed "~0s remaining" for
+  // 45 minutes. A measured fraction is the only thing that can't lie.
+  const [transcribeProgress, setTranscribeProgress] = useState(0);
+  const [asrInstall, setAsrInstall] = useState(null);
 
   const dubAbortCtrlRef = useRef(null);
   const dubClientJobIdRef = useRef(null);
+  const asrInstallTaskRef = useRef(null);
+  const retryTranscribeRef = useRef(null);
+  const pendingSrtRef = useRef(null);
+
+  const _showMissingAsr = useCallback(
+    (payload) => {
+      const rec = payload?.recommended;
+      setAsrInstall({
+        phase: 'missing',
+        percent: null,
+        payload,
+        repoId: rec?.repo_id || '',
+        label: rec?.label || rec?.repo_id || '',
+        sizeGb: rec?.size_gb,
+        jobId: useAppStore.getState().dubJobId,
+      });
+      setDubError(t('asr_missing.message'));
+      setDubStep('idle');
+      useAppStore.getState().dismissPill();
+    },
+    [setDubError, setDubStep],
+  );
+
+  const handleInstallMissingAsr = useCallback(async () => {
+    if (!asrInstall?.payload || asrInstall.phase === 'installing') return;
+    const initiatingJobId = asrInstall.jobId;
+    const ctrl = new AbortController();
+    const installTask = {
+      ctrl,
+      repoId: asrInstall.repoId,
+      jobId: initiatingJobId,
+    };
+    asrInstallTaskRef.current = installTask;
+    setDubError('');
+    setDubStep('installing-asr');
+    setAsrInstall((current) => ({ ...current, phase: 'installing', percent: 0 }));
+    useAppStore
+      .getState()
+      .showPill('loading-model', t('dub.install_progress', { engine: asrInstall.label }), {
+        progress: 0,
+        cancellable: true,
+        homeMode: 'dub',
+      });
+    try {
+      await installRecommendedAsr(asrInstall.payload, {
+        signal: ctrl.signal,
+        onProgress: ({ percent }) => {
+          setAsrInstall((current) =>
+            current ? { ...current, phase: 'installing', percent } : current,
+          );
+          useAppStore.getState().setPillProgress(percent);
+        },
+      });
+      if (useAppStore.getState().dubJobId !== initiatingJobId) return;
+      setAsrInstall(null);
+      setDubError('');
+      setDubStep('idle');
+      useAppStore.getState().completePill(t('dub.install_ok', { engine: asrInstall.label }));
+      await retryTranscribeRef.current?.();
+    } catch (error) {
+      if (useAppStore.getState().dubJobId !== initiatingJobId) return;
+      const aborted = error?.name === 'AbortError';
+      const message = aborted
+        ? t('dub_workflow.retry_cancelled')
+        : t('asr_missing.install_failed', { message: error?.message || String(error) });
+      setDubStep('idle');
+      setDubError(message);
+      setAsrInstall((current) =>
+        current ? { ...current, phase: 'missing', percent: null } : current,
+      );
+      if (aborted) useAppStore.getState().dismissPill();
+      else useAppStore.getState().errorPill(message);
+    } finally {
+      if (asrInstallTaskRef.current === installTask) asrInstallTaskRef.current = null;
+    }
+  }, [asrInstall, setDubError, setDubStep]);
 
   // Reset a stale dub session (the persisted job is gone server-side, #660):
   // clear the dead id/state, drop any pill, and prompt a fresh upload with a
   // calm info toast — never a bug-report prompt, since this is expected.
   const _resetStaleDubSession = useCallback(() => {
+    pendingSrtRef.current = null;
     setDubJobId('');
     setDubTaskId('');
     setDubSegments([]);
     setDubError('');
+    setAsrInstall(null);
     setDubStep('idle');
     setTranscribeStart(null);
     try {
@@ -121,10 +226,100 @@ export default function useDubWorkflow({
     );
   }, [setDubJobId, setDubTaskId, setDubSegments, setDubError, setDubStep]);
 
+  const _performSrtImport = useCallback(
+    async (jobId, file, signal) => {
+      if (
+        signal?.aborted ||
+        useAppStore.getState().dubJobId !== jobId ||
+        pendingSrtRef.current !== file
+      )
+        return false;
+      try {
+        setDubError('');
+        const res = await dubImportSrt(jobId, file, { signal });
+        if (
+          signal?.aborted ||
+          useAppStore.getState().dubJobId !== jobId ||
+          pendingSrtRef.current !== file
+        )
+          return false;
+        const segs = (res && res.segments) || [];
+        setDubSegments(
+          segs.map((s) => ({
+            ...s,
+            id: s.id != null ? String(s.id) : String(Math.random()),
+          })),
+        );
+        setDubStep('editing');
+        const stats = res?.stats || {};
+        const noteParts = [
+          t('dub_workflow.imported_cues', {
+            count: stats.imported ?? segs.length,
+            file: file.name || '.srt',
+          }),
+        ];
+        if (stats.skipped_malformed)
+          noteParts.push(t('dub_workflow.skipped_malformed', { count: stats.skipped_malformed }));
+        if (stats.dropped_overlap)
+          noteParts.push(t('dub_workflow.dropped_overlap', { count: stats.dropped_overlap }));
+        if (stats.clamped_to_duration)
+          noteParts.push(
+            t('dub_workflow.clamped_to_duration', { count: stats.clamped_to_duration }),
+          );
+        toast.success(noteParts.join(' · '), { duration: 6000 });
+        loadProjects();
+        return true;
+      } catch (err) {
+        if (err?.name === 'AbortError') throw err;
+        if (
+          signal?.aborted ||
+          useAppStore.getState().dubJobId !== jobId ||
+          pendingSrtRef.current !== file
+        )
+          return false;
+        if (isExpiredDubJobError(err)) {
+          _resetStaleDubSession();
+          return false;
+        }
+        const msg = err?.message || t('dub_workflow.srt_import_failed');
+        setDubError(msg);
+        setDubStep('editing');
+        toast.error(msg);
+        return false;
+      }
+    },
+    [setDubError, setDubSegments, setDubStep, loadProjects, _resetStaleDubSession],
+  );
+
+  const _applyQueuedSrt = useCallback(
+    async (jobId, ctrl) => {
+      let queuedSrt = pendingSrtRef.current;
+      if (!queuedSrt) {
+        setDubStep('editing');
+        return true;
+      }
+      while (true) {
+        const imported = await applyQueuedSrtImport(
+          pendingSrtRef,
+          jobId,
+          ctrl?.signal,
+          _performSrtImport,
+        );
+        if (ctrl?.signal.aborted || useAppStore.getState().dubJobId !== jobId) return false;
+        const replacement = pendingSrtRef.current;
+        if (!replacement) return imported;
+        if (replacement === queuedSrt) return false;
+        queuedSrt = replacement;
+      }
+    },
+    [setDubStep, _performSrtImport],
+  );
+
   // Timer for transcribe elapsed
   useEffect(() => {
     if (!transcribeStart) {
       setTranscribeElapsed(0);
+      setTranscribeProgress(0);
       return;
     }
     const iv = setInterval(
@@ -172,6 +367,9 @@ export default function useDubWorkflow({
               text_original: s.text_original || s.text || '',
             }));
             setDubSegments((prev) => [...prev, ...incoming]);
+            if (typeof m.progress === 'number' && m.progress > 0) {
+              setTranscribeProgress(Math.min(1, m.progress));
+            }
           } catch (err) {
             /* ignore parse errors */
           }
@@ -187,10 +385,11 @@ export default function useDubWorkflow({
             }));
             // #486: bind each segment to its detected speaker's clone up front, so
             // a 2-speaker dub doesn't land every row on "Default".
-            setDubSegments(applySpeakerCloneDefaults(normalized, m.speaker_clones));
+            const castSources = m.cast_sources || m.speaker_clones || {};
+            setDubSegments(applySpeakerCloneDefaults(normalized, castSources));
             setDubTranscript(m.full_transcript || '');
-            if (m.speaker_clones && typeof m.speaker_clones === 'object') {
-              setSpeakerClones(m.speaker_clones);
+            if (castSources && typeof castSources === 'object') {
+              setSpeakerClones(castSources);
             }
           } catch (err) {
             console.warn('Transcribe SSE handler failed:', err);
@@ -226,7 +425,12 @@ export default function useDubWorkflow({
             if (m && m.detail) {
               lastErrorDetail = m.detail;
               close();
-              reject(new Error(m.detail));
+              // Typed "no ASR model installed" preflight (TTS-only install):
+              // tag the rejection so the catch sites can render the one-click
+              // download CTA instead of the generic report toast.
+              const err = new Error(m.detail);
+              if (m.error === 'asr_model_missing') err.asrModelMissing = m;
+              reject(err);
               return;
             }
           } catch {
@@ -246,11 +450,18 @@ export default function useDubWorkflow({
             return;
           }
           close();
-          reject(
-            new Error(
-              'Transcribe stream dropped before emitting any segments. Likely ASR backend failed to load — check backend log + Settings → Models.',
-            ),
-          );
+          // The stream died with NO terminal event, which the backend contract
+          // forbids — so the backend PROCESS went away (on small GPUs, a VRAM
+          // abort while loading ASR is the usual trigger). Ask the shell's crash
+          // forensics rather than guessing "ASR failed to load" (#1062).
+          // The fallback no longer names a cause. streamDropError() checks the
+          // crash forensics AND whether the backend is still answering, and
+          // only this message survives when both are inconclusive — asserting
+          // "ASR failed to load" there sent #1242's reporter after a model
+          // that had loaded fine.
+          streamDropError(
+            'Transcribe stream ended before any segments arrived, and the backend could not be reached to say why — check the backend log, and Model Catalogue → Models if the ASR model was still downloading.',
+          ).then(reject, reject);
         });
       }),
     [setDubSegments, setDubTranscript, setSpeakerClones],
@@ -390,7 +601,9 @@ export default function useDubWorkflow({
             close();
             ctrl.signal.removeEventListener('abort', onAbort);
             if (lastData && lastData.type === 'ready') resolve(lastData);
-            else reject(new Error('prep stream closed unexpectedly'));
+            // Same class as the transcribe drop (#1062): a prep stream that
+            // closes with no terminal event means the backend died under it.
+            else streamDropError('prep stream closed unexpectedly').then(reject, reject);
           }
         };
       }),
@@ -408,11 +621,18 @@ export default function useDubWorkflow({
   const handleDubUpload = useCallback(
     async (dubVideoFile) => {
       if (!dubVideoFile) return;
+      const pendingInstall = asrInstallTaskRef.current;
+      pendingInstall?.ctrl.abort();
+      if (pendingInstall?.repoId) {
+        void cancelInstallModel(pendingInstall.repoId).catch(() => {});
+      }
       addBreadcrumb('dub:upload');
       setDubStep('uploading');
+      setAsrInstall(null);
       setDubError('');
       setDubFailure(null);
       setDubTracks([]);
+      pendingSrtRef.current = null;
       setDubPrepStage('download');
       setDubPrepProgress({ percent: null, speedBps: null, etaS: null, stageStartedAt: Date.now() });
       const ctrl = new AbortController();
@@ -431,7 +651,11 @@ export default function useDubWorkflow({
           { cancellable: true, homeMode: 'dub' },
         );
       try {
-        const data = await dubUpload(dubVideoFile, clientJobId, { signal: ctrl.signal, inputType });
+        const data = await dubUpload(dubVideoFile, clientJobId, {
+          signal: ctrl.signal,
+          inputType,
+          sourceLang: dubSourceLangCode,
+        });
         setDubJobId(data.job_id);
         if (data.filename) setDubFilename(data.filename);
         setDubTaskId(data.task_id);
@@ -453,7 +677,7 @@ export default function useDubWorkflow({
         });
         await _waitForTranscribe(data.job_id, ctrl);
         setTranscribeStart(null);
-        setDubStep('editing');
+        await _applyQueuedSrt(data.job_id, ctrl);
         useAppStore.getState().completePill(t('dub_workflow.transcription_complete'));
         loadProjects();
         loadProfiles();
@@ -465,6 +689,9 @@ export default function useDubWorkflow({
           useAppStore.getState().dismissPill();
         } else if (isExpiredDubJobError(err)) {
           _resetStaleDubSession();
+        } else if (asrMissingPayload(err)) {
+          // Typed preflight: no ASR model installed → download CTA, not a report.
+          _showMissingAsr(asrMissingPayload(err));
         } else {
           setDubError(err.message);
           setDubStep('idle');
@@ -488,9 +715,12 @@ export default function useDubWorkflow({
       setDubSegments,
       _waitForPrep,
       _waitForTranscribe,
+      _applyQueuedSrt,
       loadProjects,
       loadProfiles,
       _resetStaleDubSession,
+      _showMissingAsr,
+      dubSourceLangCode,
     ],
   );
 
@@ -498,11 +728,18 @@ export default function useDubWorkflow({
     async (url, opts = {}) => {
       const clean = (url || '').trim();
       if (!clean) return;
+      const pendingInstall = asrInstallTaskRef.current;
+      pendingInstall?.ctrl.abort();
+      if (pendingInstall?.repoId) {
+        void cancelInstallModel(pendingInstall.repoId).catch(() => {});
+      }
       addBreadcrumb('dub:ingest-url');
       setDubStep('uploading');
+      setAsrInstall(null);
       setDubError('');
       setDubFailure(null);
       setDubTracks([]);
+      pendingSrtRef.current = null;
       setDubPrepStage('download');
       setDubPrepProgress({ percent: null, speedBps: null, etaS: null, stageStartedAt: Date.now() });
       const ctrl = new AbortController();
@@ -519,6 +756,8 @@ export default function useDubWorkflow({
           signal: ctrl.signal,
           fetchSubs: !!opts.fetchSubs,
           subLangs: opts.subLangs,
+          cookieFile: opts.cookieFile,
+          sourceLang: dubSourceLangCode,
         });
         setDubJobId(data.job_id);
         setDubTaskId(data.task_id);
@@ -539,7 +778,7 @@ export default function useDubWorkflow({
         });
         await _waitForTranscribe(data.job_id, ctrl);
         setTranscribeStart(null);
-        setDubStep('editing');
+        await _applyQueuedSrt(data.job_id, ctrl);
         useAppStore.getState().completePill(t('dub_workflow.transcription_complete'));
         loadProjects();
         loadProfiles();
@@ -552,11 +791,20 @@ export default function useDubWorkflow({
           useAppStore.getState().dismissPill();
         } else if (isExpiredDubJobError(err)) {
           _resetStaleDubSession();
+        } else if (asrMissingPayload(err)) {
+          _showMissingAsr(asrMissingPayload(err));
         } else {
-          setDubError(err.message);
+          const cookieErrorKey =
+            err?.code === DUB_COOKIE_TRANSPORT_ERROR
+              ? 'dub.cookie_transport_error'
+              : err?.code === DUB_COOKIE_SIZE_ERROR
+                ? 'dub.cookie_size_error'
+                : null;
+          const message = cookieErrorKey ? t(cookieErrorKey) : err.message;
+          setDubError(message);
           setDubStep('idle');
-          toastErrorWithReport(t('dub_workflow.ingest_failed', { message: err.message }), err);
-          useAppStore.getState().errorPill(err.message);
+          toastErrorWithReport(t('dub_workflow.ingest_failed', { message }), err);
+          useAppStore.getState().errorPill(message);
         }
         setTranscribeStart(null);
       } finally {
@@ -574,13 +822,25 @@ export default function useDubWorkflow({
       setDubSegments,
       _waitForPrep,
       _waitForTranscribe,
+      _applyQueuedSrt,
       loadProjects,
       loadProfiles,
       _resetStaleDubSession,
+      _showMissingAsr,
+      dubSourceLangCode,
     ],
   );
 
   const handleDubAbort = useCallback(async () => {
+    pendingSrtRef.current = null;
+    const pendingInstall = asrInstallTaskRef.current;
+    if (pendingInstall) {
+      pendingInstall.ctrl.abort();
+      if (pendingInstall.repoId) {
+        await cancelInstallModel(pendingInstall.repoId).catch(() => {});
+      }
+      return;
+    }
     const jobId = dubClientJobIdRef.current || dubJobId;
     if (dubAbortCtrlRef.current) dubAbortCtrlRef.current.abort();
     if (jobId) await apiDubAbort(jobId);
@@ -588,6 +848,7 @@ export default function useDubWorkflow({
 
   const handleDubRetryTranscribe = useCallback(async () => {
     if (!dubJobId) return;
+    setAsrInstall(null);
     const ctrl = new AbortController();
     dubAbortCtrlRef.current = ctrl;
     setDubError('');
@@ -597,7 +858,7 @@ export default function useDubWorkflow({
     try {
       await _waitForTranscribe(dubJobId, ctrl);
       setTranscribeStart(null);
-      setDubStep('editing');
+      await _applyQueuedSrt(dubJobId, ctrl);
       loadProjects();
     } catch (err) {
       setTranscribeStart(null);
@@ -606,6 +867,8 @@ export default function useDubWorkflow({
         setDubStep('idle');
       } else if (isExpiredDubJobError(err)) {
         _resetStaleDubSession();
+      } else if (asrMissingPayload(err)) {
+        _showMissingAsr(asrMissingPayload(err));
       } else {
         setDubError(err.message);
         setDubStep('idle');
@@ -620,56 +883,31 @@ export default function useDubWorkflow({
     setDubSegments,
     setDubStep,
     _waitForTranscribe,
+    _applyQueuedSrt,
     loadProjects,
     _resetStaleDubSession,
+    _showMissingAsr,
   ]);
+  useEffect(() => {
+    retryTranscribeRef.current = handleDubRetryTranscribe;
+  }, [handleDubRetryTranscribe]);
 
   const handleDubImportSrt = useCallback(
-    async (file) => {
-      if (!dubJobId) {
+    async (file, { jobId = dubJobId, sourceAnalysisComplete = false, signal } = {}) => {
+      if (!jobId) {
         toast.error(t('dub_workflow.import_srt_no_job'));
         return;
       }
       if (!file) return;
-      try {
-        setDubError('');
-        const res = await dubImportSrt(dubJobId, file);
-        const segs = (res && res.segments) || [];
-        setDubSegments(
-          segs.map((s) => ({
-            ...s,
-            id: s.id != null ? String(s.id) : String(Math.random()),
-          })),
-        );
-        setDubStep('editing');
-        const stats = res?.stats || {};
-        const noteParts = [
-          t('dub_workflow.imported_cues', {
-            count: stats.imported ?? segs.length,
-            file: file.name || '.srt',
-          }),
-        ];
-        if (stats.skipped_malformed)
-          noteParts.push(t('dub_workflow.skipped_malformed', { count: stats.skipped_malformed }));
-        if (stats.dropped_overlap)
-          noteParts.push(t('dub_workflow.dropped_overlap', { count: stats.dropped_overlap }));
-        if (stats.clamped_to_duration)
-          noteParts.push(
-            t('dub_workflow.clamped_to_duration', { count: stats.clamped_to_duration }),
-          );
-        toast.success(noteParts.join(' · '), { duration: 6000 });
-        loadProjects();
-      } catch (err) {
-        if (isExpiredDubJobError(err)) {
-          _resetStaleDubSession();
-          return;
-        }
-        const msg = err?.message || t('dub_workflow.srt_import_failed');
-        setDubError(msg);
-        toast.error(msg);
+      if (shouldQueueSrtImport(dubStep, sourceAnalysisComplete)) {
+        pendingSrtRef.current = file;
+        toast(t('dub_workflow.import_srt_after_speakers'));
+        return false;
       }
+      pendingSrtRef.current = file;
+      return applyQueuedSrtImport(pendingSrtRef, jobId, signal, _performSrtImport);
     },
-    [dubJobId, setDubError, setDubSegments, setDubStep, loadProjects, _resetStaleDubSession],
+    [dubJobId, dubStep, _performSrtImport],
   );
 
   const handleCleanupSegments = useCallback(async () => {
@@ -687,109 +925,209 @@ export default function useDubWorkflow({
     }
   }, [dubJobId, dubSegments, setDubSegments]);
 
-  const handleTranslateAll = useCallback(async () => {
-    if (!dubSegments.length || !dubLangCode) return;
-    setIsTranslating(true);
-    // Root cause of the "sticky TRANSLATION FAILED banner": a new translate
-    // attempt never cleared the previous failure, so a stale 400 survived even
-    // a successful retry. Clear it up front — the whole class of translate/
-    // pipeline error banners should reset on the next relevant action.
-    setDubError('');
-    try {
-      const data = await dubTranslate({
-        segments: dubSegments.map((s) => ({
-          id: String(s.id),
-          text: s.text_original && s.text_original.trim() ? s.text_original : s.text,
-          target_lang: s.target_lang,
-          direction: s.direction || undefined,
-          slot_seconds: s.end != null && s.start != null ? s.end - s.start : undefined,
-        })),
-        target_lang: dubLangCode,
-        provider: translateProvider,
-        quality: translateQuality,
-        // #280: regional dialect — only sent when it matches the target
-        // language so a stale "es-AR" never rides on a French translate.
-        dialect: dialectMatchesLang(dubDialect, dubLangCode) ? dubDialect : undefined,
-        glossary: glossaryTerms.length
-          ? glossaryTerms.map((t) => ({ source: t.source, target: t.target, note: t.note || '' }))
-          : undefined,
-      });
-      const translatedMap = {};
-      const errors = [];
-      (data.translated || []).forEach((t) => {
-        translatedMap[t.id] = t;
-        if (t.error) errors.push({ id: t.id, error: t.error });
-      });
-      setDubSegments(
-        dubSegments.map((s) => {
-          const hit = translatedMap[s.id];
-          if (!hit) return s;
-          return {
-            ...s,
-            text: hit.text && hit.text.trim() ? hit.text : s.text,
-            translate_error: hit.error || undefined,
-            translate_literal: hit.literal || undefined,
-            translate_critique: hit.critique || undefined,
-            // Carry over the predicted compression ratio so the per-row
-            // badge + job-level compression warning can light up before
-            // the user clicks Generate Dub.
-            rate_ratio: hit.rate_ratio != null ? hit.rate_ratio : s.rate_ratio,
-            rate_error: hit.rate_error || s.rate_error,
-          };
-        }),
-      );
-      if (data.cinematic_skipped === 'no-llm-configured') {
-        toast(t('dub_workflow.cinematic_no_llm'), { icon: 'ℹ️', duration: 8000 });
-        // #372: the backend fell back to Fast — reflect that in the toggle so
-        // the UI doesn't claim Cinematic while delivering Fast.
-        useAppStore.getState().setTranslateQuality?.('fast');
-      }
-      // #280: the user picked a dialect but the chosen engine can't honor it
-      // (Argos/NLLB/Google in Fast mode). Tell them how to make it count.
-      // #372: skip when the cinematic toast above already fired — both at once
-      // sent users in a circle ("pick Cinematic" ↔ "Cinematic needs an LLM").
-      if (
-        data.dialect &&
-        data.dialect_applied === false &&
-        data.cinematic_skipped !== 'no-llm-configured'
-      ) {
-        toast(t('dub_workflow.dialect_not_applied'), { icon: 'ℹ️', duration: 8000 });
-      }
-      if (errors.length) {
-        const unique = [...new Set(errors.map((e) => e.error))];
-        toast.error(
-          t('dub_workflow.translate_errors', {
-            errorCount: errors.length,
-            totalCount: data.translated.length,
-            firstError: unique[0].slice(0, 120),
+  // `langOverride` (optional ISO code string) is the multi-language batch path:
+  // the generate loop translates INTO each pick before dubbing it. No-arg calls
+  // (the Translate All button, the review checkpoint) behave exactly as before
+  // — the guard also shields the direct `onClick={handleTranslateAll}` usages,
+  // where the first argument is a click event, not a language.
+  // Resolves `true` when a translation landed in the segments, `false` when the
+  // request failed or nothing got translated — the batch loop skips generating
+  // that language rather than rendering a wrong-language track.
+  const handleTranslateAll = useCallback(
+    async (langOverride) => {
+      const options =
+        langOverride && typeof langOverride === 'object' && !('preventDefault' in langOverride)
+          ? langOverride
+          : {};
+      const targetLang =
+        typeof langOverride === 'string' && langOverride
+          ? langOverride
+          : options.langOverride || dubLangCode;
+      // Snapshot segments at call time: inside the multi-language loop the
+      // click-time closure is stale after the previous pick's translate pass.
+      const allSegments = useAppStore.getState().dubSegments;
+      const retryFailed = !!options.retryFailed;
+      const segs = retryFailed
+        ? allSegments.filter(
+            (segment) =>
+              segment.translate_errors?.[targetLang] ||
+              (!segment.translate_errors && segment.translate_error),
+          )
+        : allSegments;
+      if (!segs.length || !targetLang) return false;
+      setIsTranslating(true);
+      // Root cause of the "sticky TRANSLATION FAILED banner": a new translate
+      // attempt never cleared the previous failure, so a stale 400 survived even
+      // a successful retry. Clear it up front — the whole class of translate/
+      // pipeline error banners should reset on the next relevant action.
+      setDubError('');
+      let ok = false;
+      try {
+        const data = await dubTranslate({
+          segments: segs.map((s) => ({
+            id: String(s.id),
+            text: s.text_original && s.text_original.trim() ? s.text_original : s.text,
+            target_lang: s.target_lang,
+            direction: s.direction || undefined,
+            slot_seconds: s.end != null && s.start != null ? s.end - s.start : undefined,
+            // Timeline position — lets the backend's duration planner borrow
+            // silence from the gap to the next segment when classifying
+            // fits/tight/impossible before any GPU time is spent.
+            start: s.start != null ? s.start : undefined,
+            end: s.end != null ? s.end : undefined,
+          })),
+          target_lang: targetLang,
+          source_lang:
+            dubSourceLangCode && dubSourceLangCode !== 'auto' ? dubSourceLangCode : undefined,
+          provider: translateProvider,
+          quality: translateQuality,
+          // Lets the backend resolve the ASR-detected source language AND
+          // cache the auto-glossary context on the job (survives restarts).
+          job_id: dubJobId || undefined,
+          // Two-stage LLM translation quality (LLM engine only; MT engines
+          // ignore both): full-transcript auto-glossary + per-segment
+          // reflect/rewrite polish. Read at call time — the multi-language
+          // loop reuses this callback long after the click-time closure.
+          auto_glossary: useAppStore.getState().autoGlossary,
+          reflect: useAppStore.getState().reflectPass,
+          // Opt-in (default OFF): ask the LLM for shorter rewrites of
+          // segments the planner marks impossible — suggestions only.
+          condense: condenseSuggest || undefined,
+          // #280: regional dialect — only sent when it matches the target
+          // language so a stale "es-AR" never rides on a French translate.
+          dialect: dialectMatchesLang(dubDialect, targetLang) ? dubDialect : undefined,
+          glossary: glossaryTerms.length
+            ? glossaryTerms.map((t) => ({ source: t.source, target: t.target, note: t.note || '' }))
+            : undefined,
+        });
+        const translatedMap = {};
+        const errors = [];
+        const degraded = [];
+        (data.translated || []).forEach((t) => {
+          translatedMap[t.id] = t;
+          if (t.error) errors.push({ id: t.id, error: t.error });
+          // Degraded ≠ failed: the segment translated fine but the cinematic
+          // polish pass was skipped (rate limit, budget, divergent reply) and
+          // the literal text is in use. Counting these as errors used to show
+          // "4/4 segment(s) failed" over a translate that succeeded.
+          else if (t.degraded) degraded.push({ id: t.id, reason: t.degraded });
+        });
+        setDubSegments((prev) =>
+          prev.map((s) => {
+            const hit = translatedMap[s.id];
+            if (!hit) return s;
+            const gotText = !!(hit.text && hit.text.trim());
+            const translateErrors = { ...s.translate_errors };
+            if (!s.translate_errors && s.translate_error) {
+              translateErrors[targetLang] = s.translate_error;
+            }
+            if (hit.error) translateErrors[targetLang] = hit.error;
+            else delete translateErrors[targetLang];
+            return {
+              ...s,
+              text: gotText ? hit.text : s.text,
+              // P1.2 — keep every language's translation, keyed by target.
+              // `text` stays the currently-shown language (legacy single-slot
+              // contract); switching the target language swaps from this map
+              // instead of destroying the previous language's work.
+              ...(gotText ? { translations: { ...s.translations, [targetLang]: hit.text } } : {}),
+              ...(gotText ? { merge_parts: undefined } : {}),
+              translate_error: hit.error || undefined,
+              translate_errors: Object.keys(translateErrors).length ? translateErrors : undefined,
+              translate_degraded: hit.degraded || undefined,
+              translate_literal: hit.literal || undefined,
+              translate_critique: hit.critique || undefined,
+              // Carry over the predicted compression ratio so the per-row
+              // badge + job-level compression warning can light up before
+              // the user clicks Generate Dub.
+              rate_ratio: hit.rate_ratio != null ? hit.rate_ratio : s.rate_ratio,
+              rate_error: hit.rate_error || s.rate_error,
+              // Pre-synthesis duration plan (fits/tight/impossible + optional
+              // condensed-rewrite suggestion) — drives the row badge so a
+              // doomed segment is visible before Generate Dub is clicked.
+              plan: hit.plan != null ? hit.plan : s.plan,
+            };
           }),
-          { duration: 6000 },
         );
-      } else {
-        const qLabel =
-          data.quality_used === 'cinematic' ? t('dub_workflow.translated_cinematic_suffix') : '';
-        toast.success(
-          t('dub_workflow.translated_segments', {
-            count: data.translated.length,
-            lang: data.target_lang,
-          }) + qLabel,
-        );
+        // "Translated" for the batch loop means at least one segment actually
+        // got new text — an empty result or an all-errors result would make
+        // the follow-up generate render the source language verbatim.
+        const total = (data.translated || []).length;
+        ok = total > 0 && errors.length < total;
+        if (data.cinematic_skipped === 'no-llm-configured') {
+          toast(t('dub_workflow.cinematic_no_llm'), { icon: 'ℹ️', duration: 8000 });
+          // #372: the backend fell back to Fast — reflect that in the toggle so
+          // the UI doesn't claim Cinematic while delivering Fast.
+          useAppStore.getState().setTranslateQuality?.('fast');
+        }
+        // #280: the user picked a dialect but the chosen engine can't honor it
+        // (Argos/NLLB/Google in Fast mode). Tell them how to make it count.
+        // #372: skip when the cinematic toast above already fired — both at once
+        // sent users in a circle ("pick Cinematic" ↔ "Cinematic needs an LLM").
+        if (
+          data.dialect &&
+          data.dialect_applied === false &&
+          data.cinematic_skipped !== 'no-llm-configured'
+        ) {
+          toast(t('dub_workflow.dialect_not_applied'), { icon: 'ℹ️', duration: 8000 });
+        }
+        if (errors.length) {
+          const unique = [...new Set(errors.map((e) => e.error))];
+          toast.error(
+            t('dub_workflow.translate_errors', {
+              errorCount: errors.length,
+              totalCount: data.translated.length,
+              firstError: unique[0].slice(0, 120),
+            }),
+            { duration: 6000 },
+          );
+        }
+        if (degraded.length) {
+          // Some segments missed the polish pass but translated fine — a
+          // warning with the honest story, not a red "failed" over a success.
+          // Fires ALONGSIDE the error toast when a response carries both:
+          // real failures shouldn't erase the story of the rows that
+          // succeeded plainly.
+          const unique = [...new Set(degraded.map((d) => d.reason))];
+          toast(
+            t('dub_workflow.translate_degraded', {
+              count: degraded.length,
+              totalCount: data.translated.length,
+              reason: unique[0].slice(0, 120),
+            }),
+            { icon: '⚠️', duration: 8000 },
+          );
+        }
+        if (!errors.length && !degraded.length) {
+          const qLabel =
+            data.quality_used === 'cinematic' ? t('dub_workflow.translated_cinematic_suffix') : '';
+          toast.success(
+            t('dub_workflow.translated_segments', {
+              count: data.translated.length,
+              lang: data.target_lang,
+            }) + qLabel,
+          );
+        }
+      } catch (err) {
+        setDubError(t('dub_workflow.translation_failed', { message: err.message }));
       }
-    } catch (err) {
-      setDubError(t('dub_workflow.translation_failed', { message: err.message }));
-    }
-    setIsTranslating(false);
-  }, [
-    dubSegments,
-    dubLangCode,
-    dubDialect,
-    translateProvider,
-    translateQuality,
-    glossaryTerms,
-    setIsTranslating,
-    setDubSegments,
-    setDubError,
-  ]);
+      setIsTranslating(false);
+      return ok;
+    },
+    [
+      dubLangCode,
+      dubSourceLangCode,
+      dubDialect,
+      dubJobId,
+      translateProvider,
+      translateQuality,
+      condenseSuggest,
+      glossaryTerms,
+      setIsTranslating,
+      setDubSegments,
+      setDubError,
+    ],
+  );
 
   const handleDubGenerate = useCallback(
     async (opts = {}) => {
@@ -801,8 +1139,12 @@ export default function useDubWorkflow({
       // here, overriding the store's single selection (which is stale inside the
       // loop). Each run appends its track to the job's dubbed_tracks.
       const langOv = opts.langOverride || null;
+      // Snapshot segments at call time, not click time: the multi-language
+      // loop awaits a translate pass right before each generate, and the
+      // click-time closure would still hold the pre-translation text.
+      const segs = useAppStore.getState().dubSegments;
       setDubStep('generating');
-      setDubProgress({ current: 0, total: dubSegments.length, text: '' });
+      setDubProgress({ current: 0, total: segs.length, text: '' });
       setDubError('');
       const genLabel = regenOnly
         ? t('dub_workflow.regenerating', { count: regenOnly.length })
@@ -812,12 +1154,12 @@ export default function useDubWorkflow({
         .showPill('generating', genLabel, { cancellable: true, homeMode: 'dub' });
       try {
         const body = {
-          segment_ids: dubSegments.map((s) => String(s.id)),
+          segment_ids: segs.map((s) => String(s.id)),
           regen_only: regenOnly,
           // Generation inputs come from the shared helper so the stored
           // fingerprints (seg_hashes) match what /tools/incremental recomputes
           // later — see utils/segments.js (#281).
-          segments: dubSegments.map((s) => ({
+          segments: segs.map((s) => ({
             start: s.start,
             end: s.end,
             gain: s.gain !== undefined && s.gain !== 1.0 ? s.gain : undefined,
@@ -830,7 +1172,10 @@ export default function useDubWorkflow({
           guidance_scale: cfg,
           speed,
           preview,
-          timing_strategy: timingStrategy || 'concise',
+          timing_strategy: timingStrategy || 'strict_slot',
+          // Voice-identity mode for auto-clone bindings (per_line default =
+          // unchanged behaviour; consistent = one reference per speaker).
+          voice_match: voiceMatch || 'per_line',
           // Smart Fit knob overrides — only when the user customised them;
           // otherwise the backend's canonical defaults apply.
           ...(timingStrategy === 'smart_fit' && fitOptions ? { fit_options: fitOptions } : {}),
@@ -890,17 +1235,25 @@ export default function useDubWorkflow({
                       .map(([id]) => id);
                     setPreviewSegIds(previewIds);
                   }
+                  // P1.3 — hashes belong to the track that just generated
+                  // (the event carries its language), not to whatever the
+                  // store's selection is when the stream drains.
+                  const genLang = evt.language_code || body.language_code;
                   if (evt.seg_hashes && Object.keys(evt.seg_hashes).length > 0) {
-                    setLastGenFingerprints(evt.seg_hashes);
+                    setLastGenFingerprints(evt.seg_hashes, genLang);
                   } else {
                     try {
                       const plan = await apiPost('/tools/incremental', {
-                        segments: dubSegments.map((s) => ({
+                        segments: segs.map((s) => ({
                           id: String(s.id),
                           ...segmentGenInputs(s),
                         })),
+                        lang: genLang,
+                        // Must match the mode this generate ran with — it's
+                        // part of the fingerprint when non-default (#281).
+                        voice_match: voiceMatch || 'per_line',
                       });
-                      setLastGenFingerprints(plan.fingerprints || {});
+                      setLastGenFingerprints(plan.fingerprints || {}, genLang);
                     } catch (err) {
                       console.warn('Incremental plan fallback failed:', err);
                     }
@@ -926,9 +1279,9 @@ export default function useDubWorkflow({
           loadProjects();
           playPing();
           useAppStore.getState().completePill(t('dub_workflow.dub_complete'));
-          // Success-only donation prompt (#007) — a finished dub is a real
+          // Success-only donation moment — a finished dub is a real
           // deliverable. Never fires on the error / cancel branches below.
-          evaluateDonationPrompt('dub');
+          recordValueMoment('dub');
         } else {
           useAppStore.getState().dismissPill();
         }
@@ -941,7 +1294,6 @@ export default function useDubWorkflow({
     },
     [
       dubJobId,
-      dubSegments,
       dubLang,
       dubLangCode,
       dubInstruct,
@@ -951,6 +1303,7 @@ export default function useDubWorkflow({
       dubStep,
       timingStrategy,
       fitOptions,
+      voiceMatch,
       setDubStep,
       setDubProgress,
       setDubError,
@@ -984,10 +1337,13 @@ export default function useDubWorkflow({
     previewAudios,
     setPreviewAudios,
     transcribeElapsed,
+    transcribeProgress,
+    asrInstall,
     handleDubUpload,
     handleDubIngestUrl,
     handleDubAbort,
     handleDubRetryTranscribe,
+    handleInstallMissingAsr,
     handleDubStop,
     handleDubGenerate,
     handleCleanupSegments,

@@ -1,7 +1,10 @@
 import React, { useState, useRef } from 'react';
 import {
+  BookOpen,
   Search,
   Download,
+  Ellipsis,
+  Headphones,
   Play,
   Pause,
   Trash2,
@@ -12,7 +15,7 @@ import {
   Scissors,
   Package,
 } from 'lucide-react';
-import { Button, Input } from '../../ui';
+import { Button, Input, Menu } from '../../ui';
 import { useGalleryVoices } from '../../api/hooks';
 import { importPersona } from '../../api/profiles';
 import {
@@ -28,14 +31,23 @@ import { apiFetch } from '../../api/client';
 import { askConfirm } from '../../utils/dialog';
 
 // ── My Imports zone (neutral importer) ───────────────────────────────────────
-export default function ImportsZone({ t, playingId, loadingPreviewId, onPlayGallery, flash }) {
+export default function ImportsZone({
+  t,
+  playingId,
+  loadingPreviewId,
+  onPlayGallery,
+  onUseProfile,
+  flash,
+}) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState([]);
   const [isSearching, setIsSearching] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   const [trimming, setTrimming] = useState(null); // { voice, file }
+  const [savingProfileId, setSavingProfileId] = useState(null);
   const fileRef = useRef(null);
   const personaRef = useRef(null);
+  const savingProfileRef = useRef(false);
   const [importingPersona, setImportingPersona] = useState(false);
 
   const voicesQ = useGalleryVoices();
@@ -110,7 +122,12 @@ export default function ImportsZone({ t, playingId, loadingPreviewId, onPlayGall
       const r = await searchYoutube(q, 'import', 10);
       setResults(r.results || []);
     } catch (e) {
-      flash(t('gallery.search_failed', { defaultValue: 'Search failed.' }));
+      flash(
+        t('gallery.search_failed', {
+          message: e?.message || String(e),
+          defaultValue: 'Search failed: {{message}}',
+        }),
+      );
     } finally {
       setIsSearching(false);
     }
@@ -149,23 +166,42 @@ export default function ImportsZone({ t, playingId, loadingPreviewId, onPlayGall
       await uploadVoiceClip(fd);
       reload();
     } catch (err) {
-      flash(t('gallery.upload_failed', { defaultValue: 'Upload failed.' }));
+      flash(
+        t('gallery.upload_failed', {
+          message: err?.message || String(err),
+          defaultValue: 'Upload failed: {{message}}',
+        }),
+      );
     } finally {
       if (fileRef.current) fileRef.current.value = '';
     }
   };
 
-  const handleSaveProfile = async (v) => {
+  const handleSaveProfile = async (v, target = 'studio') => {
+    // Close the double-click window before React can paint `disabled`.
+    if (savingProfileRef.current) return;
+    savingProfileRef.current = true;
+    setSavingProfileId(v.id);
     try {
-      await saveVoiceAsProfile(v.id, v.name);
+      const profile = await saveVoiceAsProfile(v.id, v.name);
+      if (onUseProfile) onUseProfile(profile, target);
+      else
+        flash(
+          t('gallery.saved_as_profile', {
+            defaultValue: 'Added "{{name}}" to your voices.',
+            name: profile.name,
+          }),
+        );
+    } catch (e) {
       flash(
-        t('gallery.saved_as_profile', {
-          defaultValue: 'Added "{{name}}" to your voices.',
-          name: v.name,
+        t('gallery.save_failed', {
+          message: e?.message || String(e),
+          defaultValue: 'Could not save profile: {{message}}',
         }),
       );
-    } catch (e) {
-      flash(t('gallery.save_failed', { defaultValue: 'Could not save profile.' }));
+    } finally {
+      savingProfileRef.current = false;
+      setSavingProfileId(null);
     }
   };
 
@@ -179,8 +215,13 @@ export default function ImportsZone({ t, playingId, loadingPreviewId, onPlayGall
     try {
       await deleteGalleryVoice(v.id);
       reload();
-    } catch {
-      /* noop */
+    } catch (e) {
+      flash(
+        t('gallery.delete_failed', {
+          message: e?.message || String(e),
+          defaultValue: 'Could not delete: {{message}}',
+        }),
+      );
     }
   };
 
@@ -191,7 +232,12 @@ export default function ImportsZone({ t, playingId, loadingPreviewId, onPlayGall
       const file = new File([blob], `${v.name}.wav`, { type: 'audio/wav' });
       setTrimming({ voice: v, file });
     } catch (e) {
-      flash(t('gallery.trim_load_failed', { defaultValue: 'Could not load audio for trimming.' }));
+      flash(
+        t('gallery.trim_load_failed', {
+          message: e?.message || String(e),
+          defaultValue: 'Could not load audio for trimming: {{message}}',
+        }),
+      );
     }
   };
 
@@ -209,7 +255,12 @@ export default function ImportsZone({ t, playingId, loadingPreviewId, onPlayGall
       reload();
       setTrimming(null);
     } catch (e) {
-      flash(t('gallery.upload_failed', { defaultValue: 'Upload failed.' }));
+      flash(
+        t('gallery.upload_failed', {
+          message: e?.message || String(e),
+          defaultValue: 'Upload failed: {{message}}',
+        }),
+      );
     }
   };
 
@@ -254,6 +305,7 @@ export default function ImportsZone({ t, playingId, loadingPreviewId, onPlayGall
             type="file"
             accept="audio/*,video/*"
             hidden
+            aria-label={t('gallery.upload', { defaultValue: 'Upload file' })}
             onChange={handleUpload}
           />
           <Button
@@ -269,6 +321,9 @@ export default function ImportsZone({ t, playingId, loadingPreviewId, onPlayGall
             type="file"
             accept=".ovsvoice,.omnivoice"
             hidden
+            aria-label={t('gallery.import_persona', {
+              defaultValue: 'Import a .ovsvoice persona bundle',
+            })}
             onChange={handlePersonaImport}
           />
           <Button
@@ -348,7 +403,14 @@ export default function ImportsZone({ t, playingId, loadingPreviewId, onPlayGall
               key={v.id}
               className="flex items-center gap-[8px] px-[10px] py-[8px] bg-bg-elev-2 rounded-[8px] transition-colors hover:bg-bg-elev-1"
             >
-              <button className={voicePlay} onClick={() => onPlayGallery(v)}>
+              <button
+                className={`${voicePlay} disabled:cursor-not-allowed disabled:opacity-50`}
+                onClick={() => onPlayGallery(v)}
+                disabled={Boolean(loadingPreviewId)}
+                aria-busy={loadingPreviewId === v.id}
+                aria-label={t('gallery.preview', { defaultValue: 'Preview' })}
+                title={t('gallery.preview', { defaultValue: 'Preview' })}
+              >
                 {loadingPreviewId === v.id ? (
                   <Loader className="spin" size={16} />
                 ) : playingId === v.id ? (
@@ -372,12 +434,50 @@ export default function ImportsZone({ t, playingId, loadingPreviewId, onPlayGall
                   <Scissors size={14} />
                 </button>
                 <button
-                  className={actionBtn}
+                  className={`${actionBtn} disabled:cursor-not-allowed disabled:opacity-40`}
                   onClick={() => handleSaveProfile(v)}
+                  disabled={Boolean(savingProfileId)}
+                  aria-busy={savingProfileId === v.id}
+                  aria-label={t('gallery.use_voice', { defaultValue: 'Use voice' })}
                   title={t('gallery.use_voice', { defaultValue: 'Use voice' })}
                 >
-                  <UserPlus size={14} />
+                  {savingProfileId === v.id ? (
+                    <Loader className="spin" size={14} aria-hidden="true" />
+                  ) : (
+                    <UserPlus size={14} aria-hidden="true" />
+                  )}
                 </button>
+                {onUseProfile ? (
+                  <Menu
+                    placement="bottom-end"
+                    disabled={Boolean(savingProfileId)}
+                    items={[
+                      {
+                        id: 'stories',
+                        icon: BookOpen,
+                        label: t('gallery.use_in_stories', { defaultValue: 'Use in Stories' }),
+                        onSelect: () => handleSaveProfile(v, 'stories'),
+                      },
+                      {
+                        id: 'audiobook',
+                        icon: Headphones,
+                        label: t('gallery.set_audiobook_default', {
+                          defaultValue: 'Set as Audiobook default',
+                        }),
+                        onSelect: () => handleSaveProfile(v, 'audiobook'),
+                      },
+                    ]}
+                  >
+                    <button
+                      className={`${actionBtn} disabled:cursor-not-allowed disabled:opacity-40`}
+                      disabled={Boolean(savingProfileId)}
+                      aria-label={t('gallery.more_actions', { defaultValue: 'More actions' })}
+                      title={t('gallery.more_actions', { defaultValue: 'More actions' })}
+                    >
+                      <Ellipsis size={14} aria-hidden="true" />
+                    </button>
+                  </Menu>
+                ) : null}
                 <button
                   className="flex items-center justify-center w-[24px] h-[24px] bg-transparent text-[var(--text-secondary)] rounded-[4px] cursor-pointer hover:bg-[#3d1f1f] hover:text-[#fb4934]"
                   onClick={() => handleDelete(v)}

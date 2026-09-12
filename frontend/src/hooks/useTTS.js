@@ -1,13 +1,25 @@
 import { useState, useRef, useCallback } from 'react';
 import { useAppStore } from '../store';
-import { generateSpeech } from '../api/generate';
+import { generateSpeech, TtsGenerationBusyError } from '../api/generate';
 import { pickDesignSeed } from '../utils/seed';
 import { playBlobAudio, playPing } from '../utils/media';
+import {
+  StreamingPreviewError,
+  resolveRemoteTtsTarget,
+  shouldFallbackToClassic,
+  streamGenerateSpeech,
+  supportsStreamingPreview,
+} from '../utils/streamingTts';
 import { probeAudioDuration } from '../utils/format';
 import { CLONE_MAX_SECONDS, PRESETS } from '../utils/constants';
-import { buildDesignInstruct, designModeProfileId } from '../utils/voiceInstruct';
+import {
+  buildDesignInstruct,
+  designModeProfileId,
+  mergeDescribedAttrs,
+} from '../utils/voiceInstruct';
 import { toast } from 'react-hot-toast';
 import { toastErrorWithReport } from '../utils/errorToast';
+import { modelNotDownloadedPayload, toastModelNotDownloaded } from '../utils/modelNotDownloaded';
 import { addBreadcrumb } from '../utils/breadcrumbs';
 import i18next from 'i18next';
 const t = i18next.t.bind(i18next);
@@ -16,6 +28,11 @@ const t = i18next.t.bind(i18next);
 // shouldn't fire one toast per request. Tracks the last status surfaced this
 // session (module scope, no localStorage); resets on full reload.
 let _lastRoutingStatus = null;
+
+// Same de-dup, for "progressive playback is off because your GPU is the one
+// across the room". Keyed by worker so switching machines re-announces, while
+// ten renders in a row on the same worker say it once.
+let _lastStreamingOffWorker = null;
 
 /**
  * Encapsulates TTS generation logic, streaming response handling,
@@ -91,7 +108,12 @@ export default function useTTS({ selectedProfile, setSelectedProfile, loadHistor
 
   const applyPreset = useCallback(
     (preset) => {
-      useAppStore.getState().setVdStates(preset.attrs);
+      // #1771: run every "replace the whole vdStates" entry point through the
+      // same accent/dialect exclusivity guard the live picker uses — today's
+      // hardcoded PRESETS never set both, but a future one (or a hand-edited
+      // constants.js) shouldn't be able to rebuild the conflict the engine
+      // rejects.
+      useAppStore.getState().setVdStates(mergeDescribedAttrs(preset.attrs));
       if (preset.tags && !text.includes(preset.tags.trim())) insertTag(preset.tags);
     },
     [text, insertTag],
@@ -148,6 +170,7 @@ export default function useTTS({ selectedProfile, setSelectedProfile, loadHistor
             instruct: safeInstruct,
             unsupported,
             duplicates,
+            conflicts,
           } = buildDesignInstruct({}, instruct);
           if (unsupported.length) {
             toast(t('tts_errors.ignored_unsupported', { items: unsupported.join(', ') }), {
@@ -156,6 +179,15 @@ export default function useTTS({ selectedProfile, setSelectedProfile, loadHistor
           }
           if (duplicates.length) {
             toast(t('tts_errors.ignored_duplicate', { items: duplicates.join(', ') }), {
+              icon: '⚠️',
+            });
+          }
+          // #1771: a Chinese dialect and an English accent typed together
+          // (e.g. into a clone's free-text style field) — the engine rejects
+          // the combination outright, so drop the loser client-side instead of
+          // round-tripping a 400.
+          if (conflicts.length) {
+            toast(t('tts_errors.ignored_conflict', { items: conflicts.join(', ') }), {
               icon: '⚠️',
             });
           }
@@ -174,6 +206,7 @@ export default function useTTS({ selectedProfile, setSelectedProfile, loadHistor
           instruct: finalInstruct,
           unsupported,
           duplicates,
+          conflicts,
         } = buildDesignInstruct(vdStates, instruct);
         if (unsupported.length) {
           toast(t('tts_errors.ignored_unsupported', { items: unsupported.join(', ') }), {
@@ -182,6 +215,14 @@ export default function useTTS({ selectedProfile, setSelectedProfile, loadHistor
         }
         if (duplicates.length) {
           toast(t('tts_errors.ignored_duplicate', { items: duplicates.join(', ') }), {
+            icon: '⚠️',
+          });
+        }
+        // #1771: backstop for a dialect+accent pick that reached here anyway
+        // (the picker and vdStates-restore paths already prevent this) — drop
+        // the loser instead of letting the engine 400 on it.
+        if (conflicts.length) {
+          toast(t('tts_errors.ignored_conflict', { items: conflicts.join(', ') }), {
             icon: '⚠️',
           });
         }
@@ -202,49 +243,153 @@ export default function useTTS({ selectedProfile, setSelectedProfile, loadHistor
       // so the backend's descriptive error wins in the normal case.
       const ac = new AbortController();
       abortTimer = setTimeout(() => ac.abort(), 21 * 60 * 1000);
-      const response = await generateSpeech(formData, { signal: ac.signal });
-      const reader = response.body.getReader();
-      const chunks = [];
-      let receivedLength = 0;
-      const contentLength = parseInt(response.headers.get('Content-Length') || '0', 10);
 
-      // #526: surface the seed the backend actually used so the Design tab can
-      // display it and offer "keep this seed". Authoritative over the client
-      // guess (covers the profile-seed / materialized-seed paths too).
-      const xSeed = parseInt(response.headers.get('X-Seed') || '', 10);
-      if (Number.isInteger(xSeed)) setDesignSeed(xSeed);
+      // #1330 — one voice for both delivery paths. A dropped chunk is not an
+      // error (the audio is real), so it is a persistent-ish warning toast
+      // rather than a thrown failure, and it quotes the lost text so the user
+      // can tell at a glance what to re-render.
+      const announceDroppedText = (count, sample) => {
+        const preview = (sample || '').trim().slice(0, 120);
+        toast(
+          preview
+            ? t('tts.droppedChunksWithText', { count, text: preview })
+            : t('tts.droppedChunks', { count }),
+          { icon: '\u26a0\ufe0f', duration: 8000 },
+        );
+      };
 
-      // #21: one-time, non-blocking routing notice. The backend sets these
-      // headers only on cpu_fallback / accelerated-with-caveat (never on the
-      // benign cpu_only / clean-accelerated paths), so their mere presence is
-      // the signal. De-duped by status so a batch doesn't spam.
-      const routingStatus = response.headers.get('X-OmniVoice-Routing');
-      if (routingStatus && routingStatus !== _lastRoutingStatus) {
-        _lastRoutingStatus = routingStatus;
-        const reason = response.headers.get('X-OmniVoice-Routing-Reason') || '';
-        if (routingStatus === 'cpu_fallback') {
-          toast(t('tts.routingFallback', { reason }), { icon: '🐢' });
-        } else if (routingStatus === 'accelerated' && reason) {
-          // accelerated is only surfaced WITH a driver/arch caveat reason.
-          toast(t('tts.routingCaveat', { reason }), { icon: '⚠️' });
+      // Header handling shared by both delivery paths (streaming + classic).
+      const applyResponseHeaders = (response) => {
+        // #526: surface the seed the backend actually used so the Design tab
+        // can display it and offer "keep this seed". Authoritative over the
+        // client guess (covers the profile-seed / materialized-seed paths too).
+        const xSeed = parseInt(response.headers.get('X-Seed') || '', 10);
+        if (Number.isInteger(xSeed)) setDesignSeed(xSeed);
+
+        // #21: one-time, non-blocking routing notice. The backend sets these
+        // headers only on cpu_fallback / accelerated-with-caveat (never on the
+        // benign cpu_only / clean-accelerated paths), so their mere presence is
+        // the signal. De-duped by status so a batch doesn't spam.
+        // #1330: some of the text rendered to no audio. The take that came
+        // back is clean and simply short, so nothing else would ever tell the
+        // user — they reported it by reading along. Classic path only; the
+        // streaming path learns this from a `warning` frame (headers are sent
+        // before the render starts).
+        const droppedCount = parseInt(response.headers.get('X-OmniVoice-Dropped-Chunks') || '', 10);
+        if (Number.isInteger(droppedCount) && droppedCount > 0) {
+          announceDroppedText(droppedCount, response.headers.get('X-OmniVoice-Dropped-Text'));
+        }
+
+        const routingStatus = response.headers.get('X-OmniVoice-Routing');
+        if (routingStatus && routingStatus !== _lastRoutingStatus) {
+          _lastRoutingStatus = routingStatus;
+          const reason = response.headers.get('X-OmniVoice-Routing-Reason') || '';
+          if (routingStatus === 'cpu_fallback') {
+            toast(t('tts.routingFallback', { reason }), { icon: '🐢' });
+          } else if (routingStatus === 'accelerated' && reason) {
+            // accelerated is only surfaced WITH a driver/arch caveat reason.
+            toast(t('tts.routingCaveat', { reason }), { icon: '⚠️' });
+          }
+        }
+      };
+      const setProgressPct = (pct) =>
+        setGenerationTime((prev) => `${prev.toString().split(' ')[0]} (${pct}%)`);
+
+      // Streaming preview (feat: streaming-tts-preview): playback starts from
+      // the FIRST synthesized chunk while the rest is still rendering, via
+      // /generate stream=true — instead of staring at the spinner until the
+      // whole render lands. Only when the preview would auto-play anyway, and
+      // only when Web Audio exists (all three Tauri webviews have it; if it's
+      // ever missing we take the classic path below — identical to today).
+      // Any MID-stream failure falls back to the classic whole-file flow with
+      // no user-visible difference beyond the old wait; pre-stream HTTP errors
+      // (ApiError) throw straight to the shared catch, exactly like before.
+      //
+      // Remote GPU is the one case where it must NOT run: the stream is
+      // rendered by this process, so taking it would silently ignore the
+      // worker the user picked — a local render dressed as a remote one. The
+      // classic path below is the one that goes remote, so it wins, and the
+      // user is told why their progressive playback stopped rather than left
+      // to conclude the app got slower.
+      let streamed = false;
+      const wantsStreaming = useAppStore.getState().autoPlayPreview && supportsStreamingPreview();
+      const remoteTarget = wantsStreaming
+        ? await resolveRemoteTtsTarget({ signal: ac.signal })
+        : null;
+      if (remoteTarget) {
+        const who = remoteTarget.label || remoteTarget.workerId || '';
+        if (who !== _lastStreamingOffWorker) {
+          _lastStreamingOffWorker = who;
+          toast(t('tts.streamingOffRemote', { label: who }), { icon: '🖥️', duration: 6000 });
+        }
+      }
+      if (wantsStreaming && !remoteTarget) {
+        try {
+          await streamGenerateSpeech(formData, {
+            signal: ac.signal,
+            label: t('player.streaming_preview'),
+            finalLabel: t('player.generated_audio'),
+            onHeaders: applyResponseHeaders,
+            onProgress: setProgressPct,
+            onWarning: (ev) => {
+              if (ev?.code === 'dropped_chunks' && ev.count > 0)
+                announceDroppedText(ev.count, (ev.text || []).join(' | '));
+            },
+          });
+          streamed = true;
+        } catch (err) {
+          if (!(err instanceof StreamingPreviewError)) throw err;
+          // #1190: a RETRYABLE mid-stream failure (GPU timeout / saturated
+          // pool) must not trigger the classic re-render. The backend already
+          // spent the full budget on this text, and the abandoned job keeps
+          // holding the device until it drains — re-synthesizing the whole
+          // text right now makes the user wait out a second timeout to see the
+          // same error. Surface the backend's actionable message instead.
+          // Non-retryable failures (transport drop, Web Audio glitch) keep the
+          // classic fallback: there the whole-file path genuinely can succeed.
+          if (!shouldFallbackToClassic(err)) {
+            addBreadcrumb('generate:stream-retryable-abort');
+            throw err;
+          }
+          console.warn(
+            'Streaming preview failed mid-stream; falling back to the classic generate:',
+            err?.message || err,
+          );
+          addBreadcrumb('generate:stream-fallback');
         }
       }
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        receivedLength += value.length;
-        if (contentLength > 0) {
-          const pct = Math.round((receivedLength / contentLength) * 100);
-          setGenerationTime((prev) => `${prev.toString().split(' ')[0]} (${pct}%)`);
+      if (!streamed) {
+        const response = await generateSpeech(formData, { signal: ac.signal });
+        const reader = response.body.getReader();
+        const chunks = [];
+        let receivedLength = 0;
+        const contentLength = parseInt(response.headers.get('Content-Length') || '0', 10);
+
+        applyResponseHeaders(response);
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          receivedLength += value.length;
+          if (contentLength > 0) {
+            setProgressPct(Math.round((receivedLength / contentLength) * 100));
+          }
+        }
+
+        const blob = new Blob(chunks, { type: 'audio/wav' });
+        // #1032: honor the Settings → Appearance "Auto-play preview" pref here
+        // too. #667 added the toggle ("play the output as soon as a render
+        // finishes") but only wired the WaveformPlayer preview sites — the main
+        // generate path kept auto-playing unconditionally. getState() (not a
+        // subscription) so the freshest value is read at completion time.
+        if (useAppStore.getState().autoPlayPreview) {
+          try {
+            await playBlobAudio(blob, { label: t('player.generated_audio') });
+          } catch (e) {}
         }
       }
-
-      const blob = new Blob(chunks, { type: 'audio/wav' });
-      try {
-        await playBlobAudio(blob);
-      } catch (e) {}
 
       await loadHistory();
       setSidebarTab('history');
@@ -252,8 +397,12 @@ export default function useTTS({ selectedProfile, setSelectedProfile, loadHistor
     } catch (err) {
       // Timeouts are user-recoverable (retry / shorter input) — plain toast.
       // Real generation failures get the "Report this bug" action.
-      if (err?.name === 'AbortError') {
+      if (err instanceof TtsGenerationBusyError) {
+        toast(t('tts_errors.generation_in_progress'), { icon: '⏳' });
+      } else if (err?.name === 'AbortError') {
         toast.error(t('tts_errors.timeout'));
+      } else if (modelNotDownloadedPayload(err)) {
+        toastModelNotDownloaded(modelNotDownloadedPayload(err));
       } else {
         toastErrorWithReport(t('tts_errors.error_prefix', { message: err.message }), err);
       }

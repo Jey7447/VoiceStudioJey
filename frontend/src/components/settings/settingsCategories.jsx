@@ -9,11 +9,14 @@
  *
  * Keep this declarative — no JSX panels here (those need props/hooks and live
  * in Settings.jsx's renderCategory switch). `keywords` powers the bonus
- * "search matches a setting → jump to its category" behaviour.
+ * "search matches a setting → jump to its category" behaviour; `keywordKeys`
+ * lists i18n keys of prominent setting-row titles so the same search works in
+ * every UI language (the translated titles are matched at query time — no
+ * separate keyword translations to maintain).
  */
 import {
+  AudioLines,
   Palette,
-  Settings2,
   Plug,
   Cpu,
   Mic,
@@ -25,10 +28,14 @@ import {
   Wifi,
   Share2,
   KeyRound,
+  LockKeyhole,
+  Sparkles,
   ArrowDownToLine,
   ShieldCheck,
   FileText,
   Info,
+  Braces,
+  BarChart3,
 } from 'lucide-react';
 
 /** Sidebar groups, in display order. `labelKey` resolves via i18n. */
@@ -51,14 +58,30 @@ export const GROUPS = [
           'auto-play preview',
           'header live stats',
           'system metrics',
+          'navigation style',
+          'sidebar rail',
+          'titlebar tabs',
+          'tabs',
+          'language',
+          'locale',
+          'interface language',
+          'review mode',
+          'stage checkpoints',
         ],
-      },
-      {
-        id: 'general',
-        labelKey: 'settings.general',
-        defaultLabel: 'General',
-        icon: Settings2,
-        keywords: ['language', 'locale', 'interface language', 'review mode', 'stage checkpoints'],
+        keywordKeys: [
+          'settings.ui_scale',
+          'settings.color_theme',
+          'settings.font',
+          'settings.autoplay_preview',
+          'settings.header_live_stats',
+          'settings.nav_style',
+          // The visible option labels too, so a non-English search for "tabs"
+          // / "Leiste" matches what the user actually sees on screen.
+          'settings.nav_style_rail',
+          'settings.nav_style_tabs',
+          'settings.language',
+          'settings.review_mode',
+        ],
       },
     ],
   },
@@ -72,7 +95,25 @@ export const GROUPS = [
         labelKey: 'settings.engines',
         defaultLabel: 'Engines',
         icon: Plug,
-        keywords: ['engine', 'tts engine', 'indextts', 'cosyvoice', 'compatibility', 'gpu'],
+        // Engine selection lives in the Model Catalogue workspace now; the
+        // category stays so the old name still finds it (it renders a pointer).
+        keywords: [
+          'engine',
+          'catalogue',
+          'catalog',
+          'model catalogue',
+          'default engine',
+          'tts engine',
+          'indextts',
+          'cosyvoice',
+          'compatibility',
+          'gpu',
+          'asr',
+          'transcription',
+          'whisper',
+          'openai-compatible',
+          'remote asr',
+        ],
       },
       {
         id: 'models',
@@ -87,6 +128,9 @@ export const GROUPS = [
           'models directory',
           'hugging face mirror',
           'hf_endpoint',
+          'catalogue',
+          'catalog',
+          'model store',
         ],
       },
       {
@@ -104,6 +148,7 @@ export const GROUPS = [
           'microphone',
           'voice capture',
         ],
+        keywordKeys: ['settings.shortcut'],
       },
       {
         id: 'pronunciation',
@@ -127,6 +172,7 @@ export const GROUPS = [
           'openai',
           'api key',
         ],
+        keywordKeys: ['settings.translate_quality', 'settings.translation_providers'],
       },
     ],
   },
@@ -150,6 +196,37 @@ export const GROUPS = [
           'vram',
           'compute',
           'platform',
+          'cuda',
+          'rocm',
+          'mps',
+          'cpu',
+          'xpu',
+          'intel',
+          'timeout',
+          'generation timeout',
+          'compute budget',
+          'compute-time budget',
+        ],
+        keywordKeys: [
+          'settings.generate_budget_title',
+          'settings.generate_timeout_gpu',
+          'settings.generate_timeout_cpu',
+        ],
+      },
+      {
+        id: 'usage',
+        labelKey: 'settings.usage',
+        defaultLabel: 'Usage',
+        icon: BarChart3,
+        keywords: [
+          'usage',
+          'stats',
+          'statistics',
+          'insights',
+          'analytics',
+          'history',
+          'how much',
+          'privacy',
         ],
       },
       {
@@ -157,14 +234,105 @@ export const GROUPS = [
         labelKey: 'settings.storage',
         defaultLabel: 'Storage',
         icon: HardDrive,
-        keywords: ['storage', 'data directory', 'outputs directory', 'factory reset', 'reset'],
+        keywords: [
+          'storage',
+          'data directory',
+          'outputs directory',
+          // "factory reset" is what users search for even though the feature is
+          // now the broader "Reset & remove" — keep the old name findable.
+          'factory reset',
+          'reset',
+          'wipe',
+          'delete models',
+          'uninstall',
+          'remove all data',
+          'start over',
+          'disk usage',
+          'free space',
+          'disk space',
+          'model cache size',
+          'engine venvs',
+          'temp files',
+          'clear logs',
+        ],
+        keywordKeys: ['settings.storage_usage', 'settings.reset', 'settings.uninstall'],
+      },
+      {
+        id: 'permissions',
+        // Lives in the permissions.* i18n namespace (not settings.*) so the
+        // whole feature's strings ship as one additive block per locale.
+        labelKey: 'permissions.title',
+        defaultLabel: 'Permissions',
+        icon: LockKeyhole,
+        keywords: [
+          'permission',
+          'permissions',
+          'microphone access',
+          'mic access',
+          'accessibility',
+          'privacy & security',
+          'os permissions',
+          'grant',
+          'tcc',
+        ],
+        keywordKeys: ['permissions.microphone', 'permissions.accessibility'],
       },
       {
         id: 'network',
         labelKey: 'settings.network',
         defaultLabel: 'Network',
         icon: Wifi,
-        keywords: ['network', 'proxy', 'http proxy', 'socks', 'ffmpeg', 'ffmpeg path'],
+        // Only the proxy lives here now (applies immediately) — the
+        // restart-bound FFmpeg override moved to Audio tools below.
+        keywords: ['network', 'proxy', 'http proxy', 'socks'],
+        keywordKeys: ['settings.proxy'],
+      },
+      {
+        id: 'audio-tools',
+        labelKey: 'settings.audio_tools',
+        defaultLabel: 'Audio tools',
+        icon: AudioLines,
+        // yt-dlp updates land in an overlay read at process start (the row
+        // renders RestartBadge) — lockstep-guarded in
+        // settingsCategories.test.jsx like Models / Performance / Sharing.
+        restart: true,
+        keywords: [
+          'ffmpeg',
+          'ffprobe',
+          'ffmpeg path',
+          'yt-dlp',
+          'ytdlp',
+          'media engine',
+          'video downloader',
+          'bundled binaries',
+        ],
+        keywordKeys: ['settings.audio_tools', 'settings.ffmpeg', 'settings.audio_tools_ytdlp'],
+      },
+      {
+        id: 'workers',
+        labelKey: 'settings.workers_title',
+        defaultLabel: 'Remote workers',
+        icon: Cpu,
+        // Its own System entry rather than a section inside Sharing: this
+        // sends work OUT to machines you own, where everything under Sharing
+        // is about letting something else reach this one.
+        keywords: [
+          'remote workers',
+          'workers',
+          'gpu',
+          'second gpu',
+          'another machine',
+          'distributed',
+          'enrollment token',
+          'offload',
+          'join code',
+          'join',
+          'qr',
+          'lend gpu',
+          'share gpu',
+          'worker mode',
+        ],
+        keywordKeys: ['settings.workers_title', 'settings.workers_add'],
       },
       {
         id: 'sharing',
@@ -175,11 +343,19 @@ export const GROUPS = [
         keywords: ['sharing', 'remote backend', 'mcp', 'tailscale', 'gpu box', 'bindings'],
       },
       {
+        id: 'openapi',
+        labelKey: 'settings.openapi',
+        defaultLabel: 'VoiceStudio API',
+        icon: Braces,
+        keywords: ['api', 'openapi', 'scalar', 'rest', 'swagger', 'docs', 'reference', 'endpoints'],
+      },
+      {
         id: 'credentials',
         labelKey: 'settings.credentials',
         defaultLabel: 'Credentials',
         icon: KeyRound,
         keywords: ['credentials', 'hugging face token', 'hf token', 'api key', 'secret'],
+        keywordKeys: ['settings.hf_token_title'],
       },
       {
         id: 'llm-providers',
@@ -192,12 +368,34 @@ export const GROUPS = [
           'api key',
           'openai',
           'openrouter',
+          'orcarouter',
           'groq',
           'ollama',
           'gemini',
           'cinematic',
           'autofit',
           'translation quality',
+        ],
+        keywordKeys: ['settings.llmp_provider', 'settings.llmp_api_key', 'settings.llmp_model'],
+      },
+      {
+        id: 'llm-skills',
+        labelKey: 'settings.llm_skills',
+        defaultLabel: 'LLM Skills',
+        icon: Sparkles,
+        keywords: [
+          'llm',
+          'skills',
+          'ai features',
+          'routing',
+          'local model',
+          'ollama',
+          'lm studio',
+          'cinematic',
+          'refinement',
+          'glossary',
+          'direction',
+          'slot fitting',
         ],
       },
     ],
@@ -234,6 +432,7 @@ export const GROUPS = [
         defaultLabel: 'About',
         icon: Info,
         keywords: ['about', 'version', 'license', 'diagnostics', 'self check'],
+        keywordKeys: ['about.version', 'about.self_check'],
       },
     ],
   },
@@ -246,7 +445,7 @@ export const CATEGORIES = GROUPS.flatMap((g) => g.items.map((it) => ({ ...it, gr
 export const CATEGORY_BY_ID = Object.fromEntries(CATEGORIES.map((c) => [c.id, c]));
 
 /** The category shown on first open (and the deep-link/persist fallback). */
-export const DEFAULT_CATEGORY = 'general';
+export const DEFAULT_CATEGORY = 'appearance';
 
 /**
  * Map legacy Settings tab ids (the old 11-tab shell, still used by deep-links
@@ -254,6 +453,7 @@ export const DEFAULT_CATEGORY = 'general';
  * not listed is assumed to already be a valid new category id.
  */
 export const LEGACY_TAB_MAP = {
+  general: 'appearance',
   capture: 'dictation',
 };
 
@@ -268,13 +468,22 @@ export function resolveCategoryId(id) {
  * Given a lowercased query, return the set of category ids whose label OR any
  * keyword matches. Used to filter the sidebar and to power "search a setting →
  * jump to its category".
+ *
+ * @param {string}    query
+ * @param {function=} labelFor   (category) => translated label
+ * @param {function=} translate  i18n `t` — lets `keywordKeys` (setting-row
+ *   title keys) match in the active UI language, so a German user finds
+ *   Appearance by "Schriftart" just like an English user finds it by "font".
+ *   The English `keywords` always match too, in every locale.
  */
-export function matchCategories(query, labelFor) {
+export function matchCategories(query, labelFor, translate) {
   const q = query.trim().toLowerCase();
   if (!q) return CATEGORIES.map((c) => c.id);
   return CATEGORIES.filter((c) => {
     const label = (labelFor ? labelFor(c) : c.defaultLabel).toLowerCase();
     if (label.includes(q)) return true;
-    return (c.keywords || []).some((k) => k.toLowerCase().includes(q));
+    if ((c.keywords || []).some((k) => k.toLowerCase().includes(q))) return true;
+    if (!translate) return false;
+    return (c.keywordKeys || []).some((key) => String(translate(key)).toLowerCase().includes(q));
   }).map((c) => c.id);
 }

@@ -189,8 +189,14 @@ def client(tmp_path, monkeypatch):
     finally:
         monkeypatch.undo()
         importlib.reload(importlib.import_module("core.config"))
-        importlib.reload(importlib.import_module("core.db"))
+        _restored_db = importlib.reload(importlib.import_module("core.db"))
         importlib.reload(_main)
+        # Re-create the schema on the RESTORED data dir. The reload rebinds
+        # DB_PATH back but never re-runs init_db(), so without this the module
+        # is left pointing at a schema-less DB — which corrupts any later test
+        # that reuses the reloaded core.db / main.app (the #932 router-smoke
+        # leak; this closes the class at its source). init_db() is idempotent.
+        _restored_db.init_db()
 
 
 def test_crud_roundtrip(client):
@@ -209,6 +215,22 @@ def test_crud_roundtrip(client):
     assert client.delete(f"/pronunciation/{eid}").json()["deleted"] is True
     assert client.delete(f"/pronunciation/{eid}").json()["deleted"] is False
     assert client.get("/pronunciation").json() == []
+
+
+def test_server_mode_pronunciation_mutations_require_api_key(client, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("OMNIVOICE_SERVER_MODE", "1")
+    monkeypatch.delenv("OMNIVOICE_API_KEY", raising=False)
+    remote = TestClient(client.app, client=("172.17.0.1", 50000))
+
+    assert remote.get("/pronunciation").status_code == 200
+    assert remote.post(
+        "/pronunciation", json={"term": "GIF", "replacement": "jiff"}
+    ).status_code == 403
+    assert remote.post(
+        "/pronunciation/import", json={"entries": [], "replace": True}
+    ).status_code == 403
 
 
 def test_create_rejects_blank_term(client):

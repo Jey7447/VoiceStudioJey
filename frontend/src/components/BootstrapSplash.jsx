@@ -13,13 +13,27 @@
  * firstrun.css so setup → install → model wizard reads as one experience.
  */
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
-import { Brush, Check, ChevronDown, ChevronRight, Clipboard, Globe, Lightbulb } from 'lucide-react';
+import {
+  Brush,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Clipboard,
+  FolderOpen,
+  Globe,
+  Lightbulb,
+  Wrench,
+} from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { copyText } from '../utils/copyText';
 import { useTranslation } from 'react-i18next';
 import i18n, { LANGUAGES } from '../i18n';
 import { useAppStore } from '../store';
+import { getApiBase } from '../utils/apiBase';
+import { startSplashWatchdog, startHealthRecoveryPoll } from '../utils/splashWatchdog';
+import { flushApplicationPersistence } from '../utils/persistenceLifecycle';
 import { Button, Progress, Select } from '../ui';
+import UiScaleControl from './UiScaleControl';
 
 // First-run only: keep the setup screen out of the main bundle so every
 // regular launch pays nothing for it.
@@ -64,7 +78,39 @@ const STAGE_LABEL = {
   starting_backend: 'Starting backend…',
   ready: 'Ready',
   failed: 'Setup failed',
+  ipc_lost: 'Startup issue detected',
 };
+
+/** Race a promise against a timeout. Used for IPC calls made from the
+ *  recovery panel (#879): the whole point of that state is that IPC may be
+ *  hung, so every invoke gets a bounded wait + a manual fallback. */
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('ipc timeout')), ms)),
+  ]);
+}
+
+/** Platform-default log directory, computed client-side (no IPC available in
+ *  the recovery state). Mirrors src-tauri/src/backend.rs `backend_log_path()`.
+ *  The Windows form uses %LOCALAPPDATA% literally — Explorer expands it. */
+function defaultLogDirForPlatform() {
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+  if (ua.includes('Windows')) return '%LOCALAPPDATA%\\OmniVoice\\Logs';
+  if (ua.includes('Mac')) return '~/Library/Logs/OmniVoice';
+  return '~/.local/state/OmniVoice';
+}
+
+/** WebView2 profile cache path shown in the manual-repair fallback (#879). */
+const WEBVIEW_CACHE_PATH_WIN =
+  '%LOCALAPPDATA%\\com.debpalash.omnivoice-studio\\EBWebView\\Default\\Cache';
+
+/** True on Windows. Deliberately reads the user agent, NOT a Tauri plugin —
+ *  in the recovery state IPC is presumed dead, so OS detection must not
+ *  round-trip through it. */
+function isWindowsUA() {
+  return typeof navigator !== 'undefined' && (navigator.userAgent || '').includes('Windows');
+}
 
 const STEPS = [
   'checking',
@@ -78,8 +124,12 @@ const MAX_LOG_LINES = 200;
 
 /** Scan logs + error message for known failure patterns and return i18n keys
  *  for actionable hints (resolved with `t(...)` at render — English defaults
- *  live in locales/en.json under `bootstrap.hint_*`). */
-function detectHints(message, logs) {
+ *  live in locales/en.json under `bootstrap.hint_*`).
+ *
+ *  Exported (#1177) so BackendStartFailureNotice — which surfaces the SAME
+ *  `BootstrapStage::Failed { message }` after the splash is gone — offers the
+ *  same actionable next steps instead of re-deriving a second, drifting set. */
+export function detectHints(message, logs = []) {
   const hints = [];
   const all = (message || '') + '\n' + logs.map((l) => l.line).join('\n');
   if (/README\.md/i.test(all)) hints.push('bootstrap.hint_readme');
@@ -94,13 +144,39 @@ function detectHints(message, logs) {
   if (/uv sync failed/i.test(all)) hints.push('bootstrap.hint_uv_sync');
   if (/hatchling|build_editable/i.test(all)) hints.push('bootstrap.hint_build_backend');
   if (/ffmpeg/i.test(all) && /download|timeout/i.test(all)) hints.push('bootstrap.hint_ffmpeg');
-  if (/port.*in use|address.*in use/i.test(all)) hints.push('bootstrap.hint_port');
+  // #1223: Windows' WSAEADDRINUSE text is "only one usage of each socket
+  // address is normally permitted" — it contains neither "port ... in use" nor
+  // "address ... in use", and the OS translates it into the user's locale
+  // (the report that surfaced this was in Russian). Match the locale-
+  // independent errnos too: 10048 (Windows), 48 (macOS/BSD), 98 (Linux), and
+  // the backend's own EX_CONFIG exit code for this case.
+  if (
+    /port.*in use|address.*in use|errno 10048|errno 48|errno 98|only one usage of each socket|exit code 78/i.test(
+      all,
+    )
+  )
+    hints.push('bootstrap.hint_port');
   if (/no error output/i.test(all)) hints.push('bootstrap.hint_silent_crash');
   if (/seems stuck at|never reported ready/i.test(all)) hints.push('bootstrap.hint_stuck');
   if (/blocking GitHub|couldn't download Python|python-build-standalone|dns error/i.test(all))
     hints.push('bootstrap.hint_github_blocked');
+  // Intel-Mac backend unsupported (#889): PyTorch ships no macOS x86_64
+  // wheels, so bootstrap.rs pre-fails with this message before any sync.
+  if (/Intel Macs can't run the local AI backend/i.test(all)) {
+    return ['bootstrap.hint_intel_mac']; // retrying can never help — show only this
+  }
   if (hints.length === 0) hints.push('bootstrap.hint_default');
   return hints;
+}
+
+/** Failures no retry can ever fix — offering a Retry button for these is the
+ *  dead end #1112 reported ("clicking the buttons does nothing"): the bootstrap
+ *  re-fails identically every time. Today that's the Intel Mac (#889): PyTorch
+ *  ships no macOS x86_64 wheels, so the dependency set can never resolve there.
+ *  Keyed off the same hint the matcher produces, so the two can't drift.
+ *  Pure + exported for tests. */
+export function isUnrecoverableFailure(message, logs = []) {
+  return detectHints(message, logs).includes('bootstrap.hint_intel_mac');
 }
 
 function formatEta(seconds) {
@@ -161,7 +237,7 @@ function JourneyRail({ t }) {
   return (
     <nav
       className="flex flex-wrap items-center gap-x-5 gap-y-2"
-      aria-label={t('bootstrap.title', 'OmniVoice Studio')}
+      aria-label={t('bootstrap.title', 'VoiceStudio')}
     >
       {stages.map(([label, state]) => (
         <span
@@ -190,6 +266,101 @@ function JourneyRail({ t }) {
         </span>
       ))}
     </nav>
+  );
+}
+
+/**
+ * Recovery panel for the stuck-startup state (#879): the Tauri IPC layer is
+ * silent AND the backend never answered /health within the recovery window.
+ * Explains what happened and offers actionable exits instead of an infinite
+ * spinner. The "Repair and restart" affordance is Windows-only (it clears the
+ * cache-only directories under the WebView2 `EBWebView` profile — a
+ * Windows-specific artifact) and only
+ * exists inside this error-recovery state, never as default-mode UI.
+ */
+function IpcLostRecovery({ t }) {
+  const [showLogHint, setShowLogHint] = useState(false);
+  const [repairing, setRepairing] = useState(false);
+  const [repairFailed, setRepairFailed] = useState(false);
+
+  const handleOpenLogs = async () => {
+    try {
+      // Best effort over IPC (it may be partially alive); bounded so a hung
+      // invoke can't make the button feel dead.
+      const { invoke } = await import('@tauri-apps/api/core');
+      const tail = await withTimeout(invoke('read_log_tail', { source: 'backend' }), 3000);
+      if (!tail?.path) throw new Error('no log path');
+      const { revealItemInDir } = await import('@tauri-apps/plugin-opener');
+      await withTimeout(revealItemInDir(tail.path), 3000);
+    } catch {
+      // IPC is dead (the expected case here) — show where the logs live.
+      setShowLogHint(true);
+    }
+  };
+
+  const handleRepairRestart = async () => {
+    if (repairing) return;
+    if (!confirm(t('bootstrap.ipc_lost_repair_confirm'))) return;
+    setRepairing(true);
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      try {
+        await flushApplicationPersistence();
+      } catch (error) {
+        // Persistence may be the broken subsystem that led here. Keep the
+        // explicit recovery action available, matching the native exit timeout.
+        console.warn('[persistence] cache-repair flush failed', error);
+      }
+      // The command returns once the persistence-gated restart is queued; its
+      // native three-second deadline handles a webview that cannot acknowledge.
+      // This outer timeout catches an IPC bridge too broken to queue it at all.
+      await withTimeout(invoke('clear_webview_cache_and_relaunch'), 8000);
+    } catch (e) {
+      if (e?.message !== 'ipc timeout') console.error('repair failed', e);
+      setRepairFailed(true);
+      setRepairing(false);
+    }
+  };
+
+  return (
+    <section className="fr-rise flex flex-col gap-2.5" style={{ '--rise': 1 }}>
+      <h2 className="m-0 font-mono text-[0.62rem] font-semibold uppercase tracking-[0.18em] text-fg-muted">
+        {t('bootstrap.ipc_lost_title', "The app can't finish starting")}
+      </h2>
+      <p className="m-0 text-sm leading-relaxed text-fg-muted">{t('bootstrap.ipc_lost_body')}</p>
+      {showLogHint && (
+        <ErrorBox>
+          {t('bootstrap.ipc_lost_log_hint', { path: defaultLogDirForPlatform() })}
+        </ErrorBox>
+      )}
+      {repairFailed && (
+        <ErrorBox>
+          {t('bootstrap.ipc_lost_repair_failed', { path: WEBVIEW_CACHE_PATH_WIN })}
+        </ErrorBox>
+      )}
+      <div className="flex items-center justify-end gap-2">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={handleOpenLogs}
+          leading={<FolderOpen size={12} />}
+        >
+          {t('bootstrap.ipc_lost_open_logs', 'Open logs')}
+        </Button>
+        {isWindowsUA() && (
+          <Button
+            variant="primary"
+            onClick={handleRepairRestart}
+            disabled={repairing}
+            leading={<Wrench size={12} />}
+          >
+            {repairing
+              ? t('bootstrap.ipc_lost_repairing', 'Repairing…')
+              : t('bootstrap.ipc_lost_repair', 'Repair and restart')}
+          </Button>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -232,9 +403,21 @@ export function BootstrapSplash({ stage, message }) {
     setShowSuggestion(false);
   };
 
-  const label = t(`bootstrap.${stage}`, STAGE_LABEL[stage]);
-  const stepIndex = Math.max(0, STEPS.indexOf(stage));
-  const isFailed = stage === 'failed';
+  // ── Hooks FIRST, derived values AFTER ──────────────────────────────────
+  // Every useState/useRef must be declared before any plain `const` that
+  // reads its result. When a derived const (e.g. `isUnrecoverable`, which
+  // reads `logs`) sits *between* two hook calls, the production minifier
+  // (esbuild) merges the declarations into one comma-list and can hoist the
+  // derived const ahead of the `useState` binding it depends on — emitting
+  // `isUnrecoverable = isFailed && f(message, logs), [logs] = useState([])`.
+  // That is a temporal-dead-zone access ("Cannot access 'logs' before
+  // initialization"): it throws during render, React unmounts to an empty
+  // #root, and the whole app is a black screen. Dev/unminified builds
+  // short-circuit on `isFailed` so they never trip it — it only bites the
+  // minified release bundle (shipped in v0.3.22). Keeping all hooks above all
+  // derived reads makes the class impossible regardless of how the minifier
+  // reorders. (Guarded by tests/frontend that no derived const is interleaved
+  // among hooks.)
   const [logs, setLogs] = useState([]);
   const [logsOpen, setLogsOpen] = useState(true);
   const [copied, setCopied] = useState(false);
@@ -244,6 +427,12 @@ export function BootstrapSplash({ stage, message }) {
   const logRef = useRef(null);
   const prevProgRef = useRef(null); // {bytes, t} — last progress event
   const rateRef = useRef(0); // EMA bytes/sec across events
+
+  const label = t(`bootstrap.${stage}`, STAGE_LABEL[stage]);
+  const stepIndex = Math.max(0, STEPS.indexOf(stage));
+  const isFailed = stage === 'failed';
+  // Retrying an Intel-Mac install can never succeed — don't offer the dead end.
+  const isUnrecoverable = isFailed && isUnrecoverableFailure(message, logs);
 
   const handleRetry = async () => {
     if (retrying) return;
@@ -411,14 +600,14 @@ export function BootstrapSplash({ stage, message }) {
   // the hook order stable.)
   if (stage === 'awaiting_setup') {
     return (
-      <Suspense fallback={<div className="fixed inset-0 z-[9999] bg-bg" />}>
+      <Suspense fallback={<div className="absolute inset-0 z-[9999] bg-bg" />}>
         <FirstRunSetup />
       </Suspense>
     );
   }
 
   return (
-    <div className="fixed inset-0 z-[9999] flex flex-col items-center overflow-hidden bg-bg px-6 pt-12 font-sans text-fg">
+    <div className="absolute inset-0 z-[9999] flex flex-col items-center overflow-hidden bg-bg px-6 pt-12 font-sans text-fg">
       <div className="flex w-full max-w-[760px] flex-1 flex-col gap-4 overflow-y-auto pb-6">
         {/* ── Masthead: same identity as the setup screen ─────────────────── */}
         <header
@@ -430,14 +619,23 @@ export function BootstrapSplash({ stage, message }) {
           <JourneyRail t={t} />
           <div className="mt-2 flex flex-wrap items-end justify-between gap-6">
             <div className="min-w-0">
-              <h1 className="m-0 font-serif text-[clamp(1.6rem,3vw,2.2rem)] font-semibold leading-tight tracking-tight">
-                {t('bootstrap.title', 'OmniVoice Studio')}
-              </h1>
+              {/* Version rides beside the app name — same masthead across all
+                  three first-run acts (setup → install → models & engines), so a
+                  screenshot from any of them identifies the build. */}
+              <div className="flex flex-wrap items-baseline gap-2.5">
+                <h1 className="m-0 font-serif text-[clamp(1.6rem,3vw,2.2rem)] font-semibold leading-tight tracking-tight">
+                  {t('bootstrap.title', 'VoiceStudio')}
+                </h1>
+                <span className="font-mono text-[0.62rem] tracking-[0.14em] text-fg-subtle">
+                  v{APP_VERSION}
+                </span>
+              </div>
               <p className="mt-1.5 text-sm leading-snug text-fg-muted" aria-live="polite">
                 {label}
               </p>
             </div>
             <div className="flex shrink-0 items-center gap-2">
+              <UiScaleControl />
               <Select
                 size="sm"
                 value={locale}
@@ -488,7 +686,9 @@ export function BootstrapSplash({ stage, message }) {
           </div>
         )}
 
-        {isFailed ? (
+        {stage === 'ipc_lost' ? (
+          <IpcLostRecovery t={t} />
+        ) : isFailed ? (
           <section className="fr-rise flex flex-col gap-2.5" style={{ '--rise': 1 }}>
             <h2 className="m-0 font-mono text-[0.62rem] font-semibold uppercase tracking-[0.18em] text-fg-muted">
               {t('bootstrap.failed', 'Setup failed')}
@@ -505,18 +705,35 @@ export function BootstrapSplash({ stage, message }) {
               </ul>
             </div>
             <div className="flex items-center justify-end gap-2">
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={handleCleanRetry}
-                disabled={retrying}
-                leading={<Brush size={12} />}
-              >
-                {t('bootstrap.clean_retry', 'Clean & Retry')}
-              </Button>
-              <Button variant="primary" onClick={handleRetry} disabled={retrying}>
-                {retrying ? t('bootstrap.retrying', 'Retrying…') : t('bootstrap.retry', 'Retry')}
-              </Button>
+              {/* #1112: some failures can NEVER be retried away — an Intel Mac
+                  has no PyTorch wheels, so every retry re-fails identically and
+                  the buttons just look broken ("clicking them does nothing").
+                  Say so plainly and don't offer the dead end. */}
+              {isUnrecoverable ? (
+                <span className="text-sm text-fg-muted">
+                  {t(
+                    'bootstrap.unrecoverable',
+                    'Retrying cannot fix this — see the guidance above.',
+                  )}
+                </span>
+              ) : (
+                <>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={handleCleanRetry}
+                    disabled={retrying}
+                    leading={<Brush size={12} />}
+                  >
+                    {t('bootstrap.clean_retry', 'Clean & Retry')}
+                  </Button>
+                  <Button variant="primary" onClick={handleRetry} disabled={retrying}>
+                    {retrying
+                      ? t('bootstrap.retrying', 'Retrying…')
+                      : t('bootstrap.retry', 'Retry')}
+                  </Button>
+                </>
+              )}
             </div>
           </section>
         ) : (
@@ -628,12 +845,6 @@ export function BootstrapSplash({ stage, message }) {
             </pre>
           )}
         </section>
-
-        <footer className="mt-auto pt-2">
-          <span className="font-mono text-[0.62rem] tracking-[0.14em] text-fg-subtle">
-            OVS&thinsp;·&thinsp;v{APP_VERSION}
-          </span>
-        </footer>
       </div>
     </div>
   );
@@ -664,6 +875,46 @@ export function useBootstrapStage(pollMs = 1000) {
     let cancelled = false;
     let timer = null;
     let misses = 0;
+    // #1156: `failed` is terminal for the IPC poll loop, and by then the
+    // successful IPC reply has disarmed the #879 watchdog — so nothing was
+    // left to notice the backend coming back (supervisor restart, finished
+    // repair) and the "Setup failed" card trapped the user until a manual
+    // reload. On entering `failed`, poll /health over plain HTTP and
+    // auto-dismiss to the app the moment the backend answers.
+    let failedRecovery = null;
+    const startFailedRecovery = () => {
+      if (failedRecovery || cancelled) return;
+      failedRecovery = startHealthRecoveryPoll({
+        healthUrl: `${getApiBase()}/health`,
+        onHealthy: () => {
+          if (cancelled) return;
+          setState({ stage: 'ready', message: null });
+        },
+      });
+    };
+    // IPC watchdog (#879): the poll loop below rides entirely on Tauri IPC.
+    // After an unclean shutdown, a corrupted WebView cache can break BOTH the
+    // IPC custom protocol and its postMessage fallback — `invoke()` then hangs
+    // without ever resolving OR rejecting, so neither the stall watchdog
+    // (#474) nor the miss counter below can fire, and the splash would spin
+    // forever even with a healthy backend. This watchdog is IPC-independent:
+    // if no `bootstrap_status` response arrives at all, it polls /health over
+    // plain HTTP and either proceeds to the app ('ready') or flips to the
+    // 'ipc_lost' recovery panel. Started synchronously, before the dynamic
+    // import — in a corrupted-webview world even that import may stall.
+    let httpForcedReady = false;
+    const watchdog = startSplashWatchdog({
+      healthUrl: `${getApiBase()}/health`,
+      onReadyViaHttp: () => {
+        if (cancelled) return;
+        httpForcedReady = true;
+        setState({ stage: 'ready', message: null });
+      },
+      onStuck: () => {
+        if (cancelled || httpForcedReady) return;
+        setState({ stage: 'ipc_lost', message: null });
+      },
+    });
     // Stall watchdog (#474): if the backend hangs in a non-terminal stage and
     // never reports `ready` (e.g. a failed Python-backend spawn on a from-source
     // build), the poll loop would otherwise spin forever and trap the user on a
@@ -674,7 +925,26 @@ export function useBootstrapStage(pollMs = 1000) {
     // (stage,message) change resets the clock so a live install never trips it.
     let lastChangeTs = Date.now();
     let lastKey = '';
-    const stallBudgetMs = (stage) => (stage === 'installing_deps' ? 20 * 60 * 1000 : 120 * 1000);
+    // `awaiting_setup` is gated on a HUMAN, not on work. Rust parks there
+    // deliberately ("nothing downloads or installs in this stage —
+    // complete_setup is the only way out of it") and waits for the install
+    // plan: mode, storage locations, region, mirrors. That is a screen built
+    // for deliberation, and a person reading it routinely takes longer than
+    // any machine stage — so a stall budget there fires on a perfectly healthy
+    // first run, replaces the setup screen with "Setup failed", and stops the
+    // IPC poll. Retry re-enters the bootstrap, which parks at awaiting_setup
+    // again, and it fails again on the same clock: an unescapable loop on the
+    // very first thing a new user sees (#1376). No budget for a stage only a
+    // person can leave.
+    const stallBudgetMs = (stage) => {
+      if (stage === 'awaiting_setup') return Infinity;
+      if (stage === 'installing_deps') return 20 * 60 * 1000;
+      // Rust owns the backend launch and waits up to five minutes so slow
+      // torch/CUDA imports can finish. Keep the splash alive beyond that
+      // window; otherwise it reports a false failure at two minutes while
+      // the supervised backend is still healthy and making progress (#1749).
+      return stage === 'starting_backend' ? 6 * 60 * 1000 : 120 * 1000;
+    };
     const invoke = async () => {
       try {
         const { invoke: tauriInvoke } = await import('@tauri-apps/api/core');
@@ -686,6 +956,7 @@ export function useBootstrapStage(pollMs = 1000) {
     (async () => {
       const tauriInvoke = await invoke();
       if (!tauriInvoke) {
+        watchdog.cancel();
         setState({ stage: 'ready', message: null });
         return;
       }
@@ -694,6 +965,12 @@ export function useBootstrapStage(pollMs = 1000) {
         try {
           const res = await tauriInvoke('bootstrap_status');
           if (cancelled) return;
+          // IPC answered — the normal path owns the transition; disarm the
+          // HTTP watchdog for good (#879). But if the watchdog already
+          // force-transitioned to the app via HTTP health, a late-thawing
+          // IPC response must not yank the user back to the splash.
+          watchdog.markIpcAlive();
+          if (httpForcedReady) return;
           misses = 0;
           const stage = res.stage || 'ready';
           const message = res.message || null;
@@ -715,12 +992,14 @@ export function useBootstrapStage(pollMs = 1000) {
                   `Check the log below, then Retry. If you're running from source, make sure ` +
                   `\`uv sync\` completed and uv/Python are on your PATH.`,
               });
-              return; // stop polling — failed is terminal
+              startFailedRecovery();
+              return; // stop IPC polling — only /health recovery remains
             }
             setState({ stage, message });
             timer = setTimeout(tick, pollMs);
           } else {
             setState({ stage, message });
+            if (stage === 'failed') startFailedRecovery();
           }
         } catch {
           // A transient IPC hiccup (e.g. the very first poll racing webview
@@ -732,6 +1011,10 @@ export function useBootstrapStage(pollMs = 1000) {
           if (misses < 5) {
             timer = setTimeout(tick, pollMs);
           } else {
+            // Conceding 'ready' after repeated fast rejections — stop the
+            // HTTP watchdog too, so it can't flip to 'ipc_lost' underneath
+            // the already-mounted main UI (#879).
+            watchdog.cancel();
             setState({ stage: 'ready', message: null });
           }
         }
@@ -740,6 +1023,8 @@ export function useBootstrapStage(pollMs = 1000) {
     })();
     return () => {
       cancelled = true;
+      watchdog.cancel();
+      if (failedRecovery) failedRecovery.cancel();
       if (timer) clearTimeout(timer);
     };
   }, [pollMs]);

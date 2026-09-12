@@ -12,11 +12,14 @@ the flush dropdown) depends on ``{models, count}`` and
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
 
 import services.model_manager as mm
 from services.model_manager import get_best_device
+
+logger = logging.getLogger("omnivoice.model_lifecycle")
 
 
 def _tts_vram_mb() -> float:
@@ -45,13 +48,36 @@ def _asr_device() -> str:
     return "cpu"
 
 
+def _active_tts_id() -> Optional[str]:
+    """Configured TTS engine id, or None if it can't be resolved. Attribution
+    is advisory — a prefs/import hiccup must never break /model/loaded."""
+    try:
+        from services.tts_backend import active_backend_id
+        return active_backend_id()
+    except Exception:
+        return None
+
+
+def _tts_attribution(engine_id: str, active: Optional[str]) -> dict:
+    """Per-entry engine attribution for TTS-family models. A model can stay
+    resident in VRAM after the user switches engines (freed only by unload/
+    idle-evict), so the panel needs to know which entry synthesis actually
+    routes to. ``is_active_engine`` is None when the active id is unknown."""
+    return {
+        "engine_id": engine_id,
+        "is_active_engine": (engine_id == active) if active is not None else None,
+    }
+
+
 def list_loaded() -> dict:
     """Enumerate every currently-loaded model. Shape: ``{"models": [...],
     "count": n}`` with per-model id/name/checkpoint/device/vram_mb/unloadable
     (+ optional ``note``)."""
     models: list[dict] = []
+    degraded_sources: list[str] = []
+    active_tts = _active_tts_id()
 
-    # 1. In-process TTS model (OmniVoice)
+    # 1. In-process TTS model (VoiceStudio)
     if mm.model is not None:
         try:
             device = str(next(mm.model.parameters()).device) if hasattr(mm.model, "parameters") else get_best_device()
@@ -59,11 +85,12 @@ def list_loaded() -> dict:
             device = get_best_device()
         models.append({
             "id": "tts",
-            "name": "OmniVoice TTS",
+            "name": "VoiceStudio TTS",
             "checkpoint": mm.resolve_omnivoice_checkpoint(),  # #693: effective checkpoint, not a leaked raw value
             "device": device,
             "vram_mb": round(_tts_vram_mb(), 1),
             "unloadable": True,
+            **_tts_attribution("omnivoice", active_tts),
         })
 
     # 2. ASR (WhisperX) — co-loaded with and released alongside the TTS model.
@@ -105,11 +132,79 @@ def list_loaded() -> dict:
                 "device": get_best_device(),
                 "vram_mb": round(float(s.get("vram_mb") or 0), 1),
                 "unloadable": True,
+                **_tts_attribution(s["id"], active_tts),
             })
+    except Exception:
+        logger.warning("Loaded-model inventory unavailable for subprocess sidecars")
+        degraded_sources.append("sidecars")
+
+    # 5. In-process engine instances that hold a model (mlx-audio, cosyvoice,
+    #    voxcpm2, kittentts, …). These live in the generate path's instance
+    #    cache, separate from the VoiceStudio core above — and were INVISIBLE here
+    #    until now, so a resident non-VoiceStudio engine (up to a few GB) didn't
+    #    show in the panel at all. Report each that currently holds a model.
+    #    VRAM isn't self-reported by these engines → 0 (unmeasured), same
+    #    convention as a CPU/uninstrumented sidecar. Enumeration is best-effort.
+    try:
+        from api.routers.engines import _ENGINE_INSTANCES
+        from services.tts_backend import OmniVoiceBackend
+
+        for cls, inst in list(_ENGINE_INSTANCES.items()):
+            if cls is OmniVoiceBackend:
+                continue  # the shared core is already section 1 (mm.model)
+            if not any(getattr(inst, a, None) is not None
+                       for a in getattr(inst, "_MODEL_ATTRS", ("_model", "_tts"))):
+                continue  # instance exists but hasn't loaded its weights
+            eid = getattr(cls, "id", cls.__name__)
+            models.append({
+                "id": f"engine:{eid}",
+                "name": getattr(inst, "display_name", None) or f"{eid} (engine)",
+                "checkpoint": eid,
+                "device": get_best_device(),
+                "vram_mb": 0,  # not self-reported by in-process engines
+                "unloadable": True,
+                **_tts_attribution(eid, active_tts),
+            })
+    except Exception:
+        logger.warning("Loaded-model inventory unavailable for in-process engines")
+        degraded_sources.append("engines")
+
+    # 6. The warm capture/dictation ASR singleton — resident until idle-released
+    #    (#1101 class). Held separately from the co-loaded WhisperX ASR above.
+    try:
+        import services.asr_backend as ab
+
+        cap = getattr(ab, "_capture_backend", None)
+        if cap is not None:
+            models.append({
+                "id": "capture-asr",
+                "name": f"{type(cap).__name__} (dictation)",
+                "checkpoint": getattr(ab, "_capture_backend_key", None) or type(cap).__name__,
+                "device": get_best_device(),
+                "vram_mb": 0,
+                "unloadable": True,
+                "note": "released after the idle timeout",
+            })
+    except Exception:
+        logger.warning("Loaded-model inventory unavailable for dictation")
+        degraded_sources.append("dictation")
+
+    # System memory snapshot — free/total RAM (and VRAM on a dedicated GPU) plus
+    # a low-memory advisory, so the panel can show pressure instead of leaving
+    # the 16 GB-Mac OOM class invisible until the backend dies.
+    system: dict = {}
+    try:
+        from services.memory_budget import available_memory, low_memory_warning
+
+        system = available_memory()
+        warn = low_memory_warning()
+        if warn:
+            system["warning"] = warn
     except Exception:
         pass
 
-    return {"models": models, "count": len(models)}
+    return {"models": models, "count": len(models), "system": system,
+            "degraded_sources": degraded_sources}
 
 
 async def unload(model_id: str) -> dict:
@@ -125,9 +220,7 @@ async def unload(model_id: str) -> dict:
 
     if model_id == "tts":
         async with mm._model_lock:
-            if mm.model is not None:
-                mm.model = None
-                mm.free_vram()
+            if mm.unload_shared_model():
                 return {"unloaded": "tts", "success": True}
         return {"unloaded": "tts", "success": False, "reason": "not loaded"}
 
@@ -137,6 +230,45 @@ async def unload(model_id: str) -> dict:
             mm.free_vram()
             return {"unloaded": "diarization", "success": True}
         return {"unloaded": "diarization", "success": False, "reason": "not loaded"}
+
+    # The warm dictation ASR (#1247, same defect). It is listed with
+    # ``"unloadable": True`` and had no branch either — found by the contract
+    # test written for the engine case, which is the whole reason that test
+    # enumerates the listing instead of hard-coding ids.
+    if model_id == "capture-asr":
+        import services.asr_backend as ab
+
+        if getattr(ab, "_capture_backend", None) is None:
+            return {"unloaded": model_id, "success": False, "reason": "not loaded"}
+        # idle_s=0 → release now. Still declines while a dictation stream holds
+        # a lease; yanking the model out from under an open session is exactly
+        # what the lease exists to prevent.
+        if ab.release_idle_capture_backend(0.0):
+            return {"unloaded": model_id, "success": True}
+        return {"unloaded": model_id, "success": False, "reason": "in use by dictation"}
+
+    # In-process engines (#1247). `list_loaded_models` has advertised these as
+    # `engine:<id>` with `"unloadable": True` since they were made visible in
+    # the panel — but this dispatcher never grew a branch for them, so pressing
+    # Unload on any of those rows answered `400 Unknown model id:
+    # engine:kittentts`. The engines already implement `unload()`; only the
+    # routing was missing.
+    if model_id.startswith("engine:"):
+        engine_id = model_id.split(":", 1)[1]
+        from api.routers.engines import _ENGINE_INSTANCES
+
+        for cls, inst in list(_ENGINE_INSTANCES.items()):
+            if (getattr(cls, "id", cls.__name__)) != engine_id:
+                continue
+            held = any(
+                getattr(inst, attr, None) is not None
+                for attr in getattr(inst, "_MODEL_ATTRS", ("_model", "_tts"))
+            )
+            if not held:
+                return {"unloaded": model_id, "success": False, "reason": "not loaded"}
+            inst.unload()  # idempotent by contract; frees device caches itself
+            return {"unloaded": model_id, "success": True}
+        return {"unloaded": model_id, "success": False, "reason": "not loaded"}
 
     raise ValueError(f"Unknown model id: {model_id}")
 

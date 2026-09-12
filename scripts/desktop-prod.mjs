@@ -24,11 +24,14 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
+import { desktopRuntimeReady } from "./desktop-runtime-preflight.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const shellScript = join(scriptDir, "desktop-prod.sh");
 const args = process.argv.slice(2);
 const isWindows = process.platform === "win32";
+
+if (!desktopRuntimeReady()) process.exit(1);
 
 /** WSL's bash.exe lives under System32 — running the script there would
  *  detect "Linux" and wipe/launch the wrong paths. Never use it. */
@@ -96,7 +99,7 @@ function failNoBash() {
       "        bun run desktop",
       "",
       "   3. Skip building from source — download the installer:",
-      "        https://github.com/debpalash/OmniVoice-Studio/releases/latest",
+      "        https://github.com/debpalash/VoiceStudio/releases/latest",
       "",
       "   More help: docs/install/windows.md",
       "",

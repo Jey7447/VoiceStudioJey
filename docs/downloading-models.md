@@ -1,12 +1,32 @@
 # Downloading models — speed & troubleshooting
 
-OmniVoice downloads models from the Hugging Face Hub on first use. This page
+VoiceStudio downloads models from the Hugging Face Hub on first use. This page
 explains how downloads are made fast, how to read the progress, and what to do
 on slow or restricted networks.
 
+When a remote GPU is selected, the catalog is filtered and curated for that
+worker's reported OS, architecture, and GPU backend—not for the control-plane
+computer. Generation checks the worker's capability report before submitting a
+job. If the required weights are positively known to be absent, VoiceStudio
+shows “model not downloaded on &lt;worker&gt;” with a download action. The download
+runs on that worker and refreshes its capabilities when it finishes; press
+Generate again afterward (the interrupted job is not automatically resubmitted).
+The same `POST /models/install` request targets either `local` or the selected
+worker, and `/setup/download-stream` reports both with a `target` field. Progress
+is tracked by `(target, repo_id)`, so simultaneous downloads of one model on two
+machines remain separate. Workers receive only an opaque model identifier and
+resolve the reviewed Hugging Face repository and pinned revision from their own
+catalog.
+Unknown or user-managed cache layouts are allowed through so existing manual
+engine installs remain compatible.
+
+Managed sidecar engines are intentionally excluded from remote installation.
+Their current installer fetches mutable source before creating an editable
+environment; install those directly on the worker until that source is pinned.
+
 ## Download backend: legacy LFS by default (accurate progress)
 
-OmniVoice ships `hf_xet` (Hugging Face's chunked, parallel, dedup transfer
+VoiceStudio ships `hf_xet` (Hugging Face's chunked, parallel, dedup transfer
 backend — the IDM/uGet-style fast path), **but currently runs with Xet
 disabled** (`HF_HUB_DISABLE_XET=1`, set by the app). Reason: Xet's transfer
 reports progress out-of-band and bypasses the byte-level progress hook, so the
@@ -28,7 +48,7 @@ State is reported at **Settings → About** / `GET /system/info`:
 - `fast_download.xet_installed` — `hf_xet` present (true)
 - `fast_download.xet_active` — whether Xet actually drives downloads (false by
   default, because of `HF_HUB_DISABLE_XET`)
-- the **⚡ fast download** badge in **Settings → Models** appears only when Xet
+- the **⚡ fast download** badge in **Model Catalogue → Models** appears only when Xet
   is *active*.
 
 The backend logs one line at startup, e.g.
@@ -40,7 +60,7 @@ Power users who want Xet's speed and don't mind coarser progress can set
 `HF_HUB_DISABLE_XET=0`. With Xet active, the overall bar advances by file and
 snaps to the exact total on completion (per-file *byte* speed isn't shown,
 which is exactly why it's off by default). Xet needs a 64-bit OS (all supported
-OmniVoice platforms).
+VoiceStudio platforms).
 
 ## Reading the progress
 
@@ -76,14 +96,38 @@ default** (set its var to `0` to disable); the rest default **off**.
 
 ## Restricted networks / mirrors (e.g. China)
 
-If `huggingface.co` is slow or blocked, point the client at a mirror:
+**Automatic (the default).** When no endpoint is explicitly configured,
+VoiceStudio picks one for you: it probes `huggingface.co` and the community
+mirror `hf-mirror.com` in parallel (short HTTPS reachability + latency
+checks — no geo-IP lookups, no third-party services; your device
+language/timezone only decides which endpoint is probed *first*), prefers the
+official endpoint unless the mirror is decisively faster, and remembers the
+winner. The decision is re-tested only on the first-run system check, after a
+network-classified download failure (the failed download retries once on the
+new winner), when it's more than 7 days old, or when you press **Test again**
+in **Settings → Models → Hugging Face mirror**. Mirror integrity is a
+non-issue: `huggingface_hub` verifies every download by checksum regardless
+of endpoint. Opt out with `OMNIVOICE_HF_ENDPOINT_MODE=manual`.
+
+**Explicit (always wins).** To pin an endpoint yourself:
 
 ```
 HF_ENDPOINT=https://hf-mirror.com
 ```
 
-Set it as an environment variable (or in **Settings → environment**) before
-downloading. Caveats:
+Set it in **Settings → Models → Hugging Face mirror** (quick-pick presets and
+a custom URL — any explicit choice switches the panel to manual mode and is
+**never** auto-switched), or as an environment variable before launching. On
+first run, the setup wizard's network check reports which endpoint the
+automatic selection picked, and still offers the mirror quick-pick when
+nothing is reachable — the check is a warning, not a blocker, so an offline
+or firewalled machine can still finish setup once models are available
+(mirror, or manual download below). If a wizard download fails because the
+**configured** mirror is unreachable, the same quick-pick (including
+**Hugging Face (official)**) appears right next to the failed row — switching
+applies to downloads **immediately** (no restart; only already-loaded engines
+re-read the endpoint at startup), clears the retry cooldown, and retries the
+failed download at once. Caveats:
 
 - A mirror serves the **classic** download path, **not Xet** — you lose
   chunk-dedup and Xet's parallel fetch, but you gain reachability. On the
@@ -92,7 +136,7 @@ downloading. Caveats:
 
 ## Cancelling a download
 
-**Settings → Models** lets you cancel an in-flight install. Cancellation stops
+**Model Catalogue → Models** lets you cancel an in-flight install. Cancellation stops
 further retries and clears the failure cooldown so you can restart
 immediately. A file that's already streaming finishes first — cancellation
 takes effect at the next retry boundary.
@@ -106,6 +150,6 @@ takes effect at the next retry boundary.
   High-performance mode only helps if RAM and bandwidth are plentiful.
 - **"download finished but no model weights were found"** — the download was
   interrupted and left a partial snapshot. Delete the model in
-  **Settings → Models** and install it again.
+  **Model Catalogue → Models** and install it again.
 - **Out of disk** — model sizes are shown in the catalog; free space or change
   the cache location with `HF_HOME` / `HF_HUB_CACHE`.

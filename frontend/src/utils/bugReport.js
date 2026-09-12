@@ -8,65 +8,46 @@
  * github.com before anything is submitted — we never POST, never hold a
  * token (CLAUDE.md Capability 2).
  *
- * `scrubText` is the frontend twin of backend/core/scrub.py and must stay
- * at least as strict for the shapes a webview can see (home paths +
- * credential-shaped substrings; env vars aren't reachable from JS).
+ * Everything assembled here is scrubbed with `scrubText` (utils/scrub.js —
+ * the frontend twin of backend/core/scrub.py), which must stay at least as
+ * strict for the shapes a webview can see (home paths + credential-shaped
+ * substrings; env vars aren't reachable from JS).
  */
 /* global __APP_VERSION__ -- injected by Vite at build time (vite.config define) */
+import i18next from 'i18next';
 import { API } from '../api/client';
+import { openExternal } from '../api/external';
 import { formatBreadcrumbs } from './breadcrumbs';
+import { crashAge, describeCrashExit, getLastBackendCrash } from './backendCrash';
+import { contactAge, lastBackendContact } from './backendContact';
+import { deploymentMode } from './deploymentMode';
+import { askConfirm } from './dialog';
+import { isOutdated, parseVersionTriple } from './staleBuild';
+import { isTauri } from './updater';
 
-export const ISSUES_URL = 'https://github.com/debpalash/OmniVoice-Studio/issues/new';
+/** Canonical project repository — every GitHub link in the app derives from
+ * this single constant so a fork/rename can never leave stale links behind. */
+export const REPO_URL = 'https://github.com/debpalash/VoiceStudio';
+
+export const ISSUES_URL = `${REPO_URL}/issues/new`;
 
 const APP_VERSION = (typeof __APP_VERSION__ !== 'undefined' && __APP_VERSION__) || 'unknown';
 
-export const REDACTED = '***REDACTED***';
-
-// Thresholds mirror backend/core/scrub.py: long enough that identifiers
-// like `hf_hub` or `sk-learn` survive, short enough that real tokens don't.
-const TOKEN_PATTERNS = [
-  /hf_[A-Za-z0-9]{30,}/g, // HuggingFace
-  /github_pat_[A-Za-z0-9_]{20,}/g, // GitHub fine-grained PAT
-  /gh[pousr]_[A-Za-z0-9]{30,}/g, // GitHub classic tokens
-  /sk-[A-Za-z0-9_-]{20,}/g, // OpenAI-style API keys
-  // A backend error can carry a secret from any provider over HTTP into
-  // error.message/.stack — the webview has no env-var backstop, so these
-  // shapes are its only defense. Mirror backend/core/scrub.py.
-  /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}/g, // JWT (Bearer)
-  /AIza[0-9A-Za-z_-]{35}/g, // Google API key
-  /xox[baprs]-[A-Za-z0-9-]{10,}/g, // Slack token
-  /AKIA[0-9A-Z]{16}/g, // AWS access key id
-  /bearer\s+[A-Za-z0-9._-]{16,}/gi, // opaque bearer tokens
-];
-
-// Secrets in a URL query string — redact the value, keep the param name.
-const URL_SECRET_RE =
-  /((?:access[_-]?token|api[_-]?key|apikey|auth[_-]?token|token|secret|password|passwd|pwd)=)([^&\s"'#]{6,})/gi;
-
-const HOME_PATTERNS = [
-  // Windows-with-forward-slashes must run BEFORE the bare macOS shape, or
-  // `/Users/<name>` inside `C:/Users/<name>` gets eaten first, leaving `C:~`.
-  // `i` flag: Windows is case-insensitive and tools emit lowercase `c:\users\`.
-  /(?:file:\/\/\/)?[A-Za-z]:\/Users\/[^/\s"']+/gi, // Windows, forward slashes (webview stacks, file:/// URLs)
-  /\/Users\/[^/\s"']+/gi, // macOS
-  /\/home\/[^/\s"']+/gi, // Linux
-  /[A-Za-z]:\\Users\\[^\\\s"']+/gi, // Windows, backslashes
-];
-
-/** Redact credential-shaped substrings and home directories. */
-export function scrubText(text) {
-  if (text == null) return '';
-  let s = String(text);
-  for (const pat of TOKEN_PATTERNS) s = s.replace(pat, REDACTED);
-  s = s.replace(URL_SECRET_RE, (_m, name) => `${name}${REDACTED}`);
-  for (const pat of HOME_PATTERNS) s = s.replace(pat, '~');
-  return s;
-}
+// The scrub primitives live in utils/scrub.js (#1177) so transport-layer code
+// (api/client.ts) can scrub without importing this module — bugReport imports
+// client for `API`, so the reverse static import would be a cycle. Re-exported
+// here because every existing caller (and bugReport.test.js) imports them from
+// this module.
+export { REDACTED, scrubText } from './scrub';
+import { scrubText } from './scrub';
 
 // GitHub truncates very long prefill URLs; keep the encoded result well
 // under the ~8k practical ceiling so the user never loses the form.
 const MAX_STACK_CHARS = 1800;
 const MAX_MSG_CHARS = 1200;
+// Crash-marker stderr tail budget (#941) — keep the newest end (the actual
+// traceback/abort), the head is uvicorn boot noise.
+const MAX_CRASH_TAIL_CHARS = 1200;
 // The real ceiling is on the URL-ENCODED body, not the raw string: markdown
 // encodes ~1.3–1.6× larger (newlines→%0A, spaces→%20, backticks/#//), so a
 // 6000-char raw body can be ~9k encoded and blow past GitHub's limit. Bound
@@ -101,13 +82,82 @@ async function fetchJsonWithTimeout(url, timeoutMs = 2500) {
   }
 }
 
+// ── Outdated-build deflection ────────────────────────────────────────────
+// 6 in 10 sampled "can't reach the backend" reports came from builds that
+// were already obsolete when filed and were closed with "please update".
+// Before a report is filed, best-effort establish whether the running build
+// is behind the latest release, so openBugReport() can nudge toward the
+// update and the body can carry a triage-greppable `**Build status:**` line.
+//
+// Sources per deployment (implementation differs, behavior identical):
+//  - Desktop: the Rust updater already checked at launch (channel-aware,
+//    offline-tolerant) — read its verdict from the store. No new network
+//    path, and the webview CSP has no api.github.com exception to widen.
+//  - Browser/dev/Docker: one bounded GET of the latest-release tag, made
+//    only when the user has initiated the bug-report flow — a flow whose
+//    stated destination is github.com (local-first: nothing new leaves the
+//    machine outside that consented action).
+const LATEST_RELEASE_API = `${REPO_URL.replace('https://github.com/', 'https://api.github.com/repos/')}/releases/latest`;
+
+let freshnessPromise = null;
+
+/** Test hook — the session cache would otherwise leak between tests. */
+export function _resetBuildFreshnessForTests() {
+  freshnessPromise = null;
+}
+
+async function computeBuildFreshness() {
+  // An 'unknown' dev build can't be compared, must never be nudged to
+  // "update", and must never claim to be current — stay silent entirely.
+  if (!parseVersionTriple(APP_VERSION)) return null;
+  if (isTauri()) {
+    const { useAppStore } = await import('../store');
+    const s = useAppStore.getState();
+    // 'available'/'downloading'/'ready' all mean the updater verified a
+    // newer signed release exists for the user's channel. 'idle' cannot be
+    // told apart from "not checked yet", so it stays silent rather than
+    // claiming the build is current.
+    if (['available', 'downloading', 'ready'].includes(s.updateStatus)) {
+      return { outdated: true, current: APP_VERSION, latest: s.updateVersion || null };
+    }
+    return null;
+  }
+  const j = await fetchJsonWithTimeout(LATEST_RELEASE_API);
+  const latest = String(j?.tag_name || '').replace(/^v/, '');
+  if (!latest) return null;
+  return { outdated: isOutdated(APP_VERSION, latest), current: APP_VERSION, latest };
+}
+
+/** `{ outdated, current, latest }`, or null when nothing is known. Session-
+ * cached on success; a null result is NOT cached so a temporary network
+ * blip doesn't disable the deflection for the whole session. Never rejects. */
+export async function checkBuildFreshness() {
+  if (!freshnessPromise) {
+    freshnessPromise = computeBuildFreshness()
+      .catch(() => null)
+      .then((r) => {
+        if (r == null) freshnessPromise = null;
+        return r;
+      });
+  }
+  return freshnessPromise;
+}
+
 /** Environment lines for the report body. Best-effort — every fetch is
  * optional so a dead backend still yields a usable report. */
-async function captureContext() {
+async function captureContext(fresh) {
   const lines = [
     `**Version:** \`${APP_VERSION}\``,
     `**Platform:** \`${navigator?.userAgent || 'unknown'}\``,
   ];
+  // Greppable by triage: current-version recurrence is the reliability
+  // metric, and stale-build reports must be countable separately.
+  if (fresh?.outdated) {
+    const latest = fresh.latest ? `\`v${fresh.latest}\`` : 'a newer release';
+    lines.push(`**Build status:** OUTDATED — ${latest} was already out when this was filed`);
+  } else if (fresh?.latest) {
+    lines.push(`**Build status:** current at filing time (latest \`v${fresh.latest}\`)`);
+  }
 
   try {
     const j = await fetchJsonWithTimeout(`${API}/system/info`);
@@ -139,6 +189,146 @@ async function captureContext() {
   return lines.join('\n');
 }
 
+// Python prints a CHAINED traceback root-cause-FIRST: the original error, then
+// "The above exception was the direct cause of…", then the wrapper. So keeping
+// only the newest end of stderr — right for a plain log — throws away the one
+// line that explains the crash and keeps the least informative one.
+//
+// #1376 is the case in point. The report arrived carrying
+//
+//     ModuleNotFoundError: Could not import module 'GenerationMixin'.
+//     Are this object's requirements defined correctly?
+//
+// which is transformers' lazy-import wrapper and says nothing about what
+// actually failed; the real cause had been cut. Triage had to guess it from
+// the shape of the pair. The whole point of auto-capturing stderr is to avoid
+// that round-trip, so recover the root-cause line out of the discarded head.
+// Python emits these as their own line. Anchored rather than searched as a
+// substring: stderr routinely QUOTES tracebacks (a logged exception, a
+// subprocess's captured output), and a bare `indexOf` would treat the quoted
+// text as a real chain and prepend a "root cause" from the wrong exception.
+const CHAIN_MARKER_RE =
+  /^(?:The above exception was the direct cause of the following exception|During handling of the above exception, another exception occurred):?$/;
+
+/** The error line that ends the FIRST block of a chained traceback — i.e. the
+ *  original cause. Empty string when `text` is not a chained traceback. */
+export function rootCauseLine(text) {
+  const lines = text.split('\n');
+  const marker = lines.findIndex((l) => CHAIN_MARKER_RE.test(l.trim()));
+  if (marker <= 0) return '';
+  // Walk back past the marker's blank line to the last non-indented line —
+  // traceback frames are indented, the exception line is not.
+  for (let i = marker - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (line.trim() && !/^\s/.test(line)) return line.trim();
+  }
+  return '';
+}
+
+// Below this much room for actual log output, the root-cause header stops being
+// worth its cost — a labelled line with almost nothing under it is harder to
+// act on than the raw newest output.
+const MIN_TAIL_CHARS = 400;
+
+/** Bound the crash stderr to `max` characters, keeping the newest end AND — for
+ *  a chained traceback — the root cause that would otherwise be cut.
+ *
+ *  The result never exceeds `max`: the prefix is budgeted for BEFORE slicing,
+ *  not added on top of a full-size tail. */
+export function clampCrashTail(text, max = MAX_CRASH_TAIL_CHARS) {
+  if (text.length <= max) return text;
+
+  const PLAIN = '… (truncated)';
+  const plainTail = () => `${PLAIN}\n${text.slice(-Math.max(0, max - PLAIN.length - 1))}`;
+
+  const root = rootCauseLine(text);
+  if (!root) return plainTail();
+
+  const prefix = `${root}\n… (truncated — chained traceback; the line above is the original cause)\n`;
+  const room = max - prefix.length;
+  if (room < MIN_TAIL_CHARS) return plainTail();
+
+  const kept = text.slice(-room);
+  // Already visible in what we keep — repeating it is noise, and the budget is
+  // better spent on more log.
+  if (kept.includes(root)) return plainTail();
+  return prefix + kept;
+}
+
+/** "## Last backend crash" section from the desktop shell's crash marker
+ * (#941): exit code/signal + scrubbed stderr tail, so a "backend became
+ * unreachable" report arrives WITH the evidence instead of needing a
+ * logs-please round-trip. Empty outside Tauri or when nothing ever crashed.
+ * The marker's age is stated so a stale (possibly unrelated) crash can't
+ * masquerade as fresh evidence. */
+async function captureCrashSection() {
+  let marker = null;
+  try {
+    marker = await getLastBackendCrash();
+  } catch {
+    /* shell forensics unavailable */
+  }
+  if (!marker) return [];
+  const tail = clampCrashTail(scrubText(marker.last_stderr || '').trim());
+  return [
+    '## Last backend crash (auto-captured — may predate this bug)',
+    '',
+    `**When:** ${new Date(marker.ts * 1000).toISOString()} (${crashAge(marker)} ago)`,
+    `**Exit:** \`${describeCrashExit(marker)}\``,
+    `**Uptime before crash:** ${marker.uptime_s} s`,
+    `**Backend version:** \`${marker.backend_version}\``,
+    '',
+    '```',
+    // An empty code block reads as "there was nothing to report" and produces
+    // an issue nobody can answer (#1375). Say what is missing and where the
+    // reporter can get it, so the report asks for the right thing up front.
+    tail ||
+      '(no output was captured for this crash — please paste the last ~100 ' +
+        'lines of Settings → Logs → Backend here)',
+    '```',
+    '',
+  ];
+}
+
+/** "## Backend reachability" section (#1164): which deployment this is, and
+ * whether/when the backend last answered — the two facts that split every
+ * "can't reach the backend" report into diagnosable halves (crashed
+ * mid-session vs never started). When the report is built from a transport
+ * ApiError, its structured detail (mode at failure time, first failure,
+ * retry attempts) rides along too. All values are mode ids, timestamps, and
+ * counts — nothing user-generated — but scrubbed anyway as belt-and-braces. */
+function captureReachabilitySection(error) {
+  const lines = ['## Backend reachability', ''];
+  try {
+    lines.push(`**Deployment mode:** \`${deploymentMode()}\``);
+    const last = lastBackendContact();
+    lines.push(
+      last != null
+        ? `**Last backend response:** ${contactAge(last)} before this report`
+        : '**Last backend response:** none this session — it may never have started',
+    );
+    const d = error?.detail;
+    if (d && typeof d === 'object' && !Array.isArray(d)) {
+      if (typeof d.firstFailureTs === 'number' && d.firstFailureTs > 0) {
+        lines.push(`**First failure:** ${new Date(d.firstFailureTs).toISOString()}`);
+      }
+      if (typeof d.attempts === 'number') {
+        lines.push(`**Attempts before giving up:** ${d.attempts}`);
+      }
+      if (typeof d.mode === 'string' && d.mode) {
+        lines.push(`**Mode at failure time:** \`${scrubText(d.mode)}\``);
+      }
+      if (typeof d.transport === 'string' && d.transport) {
+        lines.push(`**Transport error:** \`${scrubText(d.transport).slice(0, 200)}\``);
+      }
+    }
+  } catch {
+    /* reachability context is best-effort — never block the report */
+  }
+  lines.push('');
+  return lines;
+}
+
 /**
  * Build the prefilled GitHub Issues URL.
  *
@@ -149,7 +339,15 @@ async function captureContext() {
  *   with the actual failure attached.
  */
 export async function buildBugReportUrl({ title = '[Bug] ', error } = {}) {
-  const ctx = await captureContext();
+  const fresh = await checkBuildFreshness();
+  const ctx = await captureContext(fresh);
+  // getLastBackendCrash inside captureCrashSection covers every deployment:
+  // the desktop shell's marker, or (browser/dev/Docker) the backend's
+  // run-sentinel record via its HTTP fallback — usually unfetchable while
+  // the backend is still down, which is why the reachability section below
+  // reports the CACHED last-contact data regardless.
+  const crashSection = await captureCrashSection();
+  const reachabilitySection = captureReachabilitySection(error);
 
   const errorSection = [];
   if (error) {
@@ -194,6 +392,8 @@ export async function buildBugReportUrl({ title = '[Bug] ', error } = {}) {
     '',
     ctx,
     '',
+    ...reachabilitySection,
+    ...crashSection,
     ...crumbSection,
     '## What I was doing',
     '',
@@ -203,6 +403,39 @@ export async function buildBugReportUrl({ title = '[Bug] ', error } = {}) {
   body = fitEncoded(body, MAX_ENCODED_BODY);
 
   return `${ISSUES_URL}?title=${encodeURIComponent(title)}&labels=${encodeURIComponent('bug')}&body=${encodeURIComponent(body)}`;
+}
+
+/**
+ * The one entry point every "Report bug" affordance goes through
+ * (ReportBugButton, ErrorBoundary, error toasts, crash/start-failure
+ * notices): gate on build freshness, then open the prefilled issue.
+ *
+ * On an outdated build the user is offered the latest release first —
+ * with a file-anyway escape hatch, because "old build" is a triage
+ * heuristic, not proof the bug is fixed. Freshness is best-effort: when
+ * nothing is known the report opens exactly as before.
+ *
+ * Throws like the old openExternal(buildBugReportUrl()) composition did —
+ * call sites keep their own failure UX (toast, console warning).
+ */
+export async function openBugReport({ title, error } = {}) {
+  const fresh = await checkBuildFreshness();
+  if (fresh?.outdated) {
+    const latest = fresh.latest ? `v${fresh.latest}` : '';
+    const viewUpdate = await askConfirm(
+      i18next.t('reportBug.staleMessage', { current: `v${fresh.current}`, latest }),
+      i18next.t('reportBug.staleTitle'),
+      {
+        okLabel: i18next.t('reportBug.staleView'),
+        cancelLabel: i18next.t('reportBug.staleFileAnyway'),
+      },
+    );
+    if (viewUpdate) {
+      await openExternal(`${REPO_URL}/releases/latest`);
+      return;
+    }
+  }
+  await openExternal(await buildBugReportUrl({ title, error }));
 }
 
 /**
@@ -220,5 +453,5 @@ export function buildIssueSearchUrl(error) {
     .slice(0, 6)
     .join(' ');
   const q = `is:issue ${terms}`.trim();
-  return `https://github.com/debpalash/OmniVoice-Studio/issues?q=${encodeURIComponent(q)}`;
+  return `${REPO_URL}/issues?q=${encodeURIComponent(q)}`;
 }

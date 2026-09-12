@@ -19,6 +19,8 @@ export default function KeyboardCheatsheet({ open, onClose }) {
       title: t('keyboard.nav'),
       items: [
         ['?', t('keyboard.nav_cheatsheet')],
+        [t('keyboard.nav_enginePickerKey'), t('engines.matrixTitle')],
+        [t('keyboard.nav_workspacesKey'), t('keyboard.nav')],
         ['Esc', t('keyboard.nav_closeModal')],
         ['Cmd/Ctrl+S', t('keyboard.nav_save')],
       ],
@@ -28,6 +30,7 @@ export default function KeyboardCheatsheet({ open, onClose }) {
       items: [
         ['Cmd/Ctrl+D', t('keyboard.seg_split')],
         ['Cmd/Ctrl+M', t('keyboard.seg_merge')],
+        ['Cmd/Ctrl+Shift+M', t('keyboard.seg_merge_prev')],
         ['Cmd/Ctrl+Z', t('keyboard.seg_undo')],
         ['Cmd/Ctrl+Shift+Z', t('keyboard.seg_redo')],
         ['Click row', t('keyboard.seg_click')],

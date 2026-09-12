@@ -1,8 +1,17 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 import { useTranslation } from 'react-i18next';
 import { Play, Headphones } from 'lucide-react';
 import {
-  REGION_COLORS,
+  getRegionColors,
+  subscribeRegionColors,
   SNAP_PX,
   visibleSegmentRange,
   snapTime,
@@ -16,6 +25,10 @@ const ONSET_STRIP_H = 8; // px — non-interactive onset tick strip
 const KB_STEP_S = 0.01; // ←/→ nudge
 const KB_STEP_BIG_S = 0.1; // Ctrl+←/→ nudge
 const DRAG_DEADZONE_PX = 3;
+// Small/medium dubbing jobs are cheap enough to render in full. Avoid tying
+// visibility to transient WaveSurfer resize/zoom metrics until the transcript
+// is genuinely large; this also keeps short multi-speaker clips complete.
+const VIRTUALIZE_THRESHOLD = 200;
 
 const fmt = (t) => {
   const m = Math.floor(t / 60);
@@ -27,11 +40,15 @@ const fmt = (t) => {
  * SegmentTrack — custom DOM segment editor lane for the dub timeline (#280).
  *
  * Replaces the WaveSurfer Regions plugin in the editing path. Renders one
- * absolutely-positioned box per segment inside a lane whose horizontal
- * position is derived from a single {pxPerSec, scrollLeft} source (read off
- * WaveSurfer's wrapper by the parent), so boxes stay pixel-aligned with the
- * waveform across zoom/scroll/resize. Virtualized by TIME — only the boxes
- * inside the visible window (+ buffer) are mounted.
+ * absolutely-positioned box per segment, each placed in PURE LAYOUT from a
+ * single {pxPerSec, scrollLeft} source (read off WaveSurfer's wrapper by the
+ * parent), so boxes stay pixel-aligned with the waveform across
+ * zoom/scroll/resize. The lane itself must NEVER be transform-animated: a
+ * lane translateX'd on every playback tick gets promoted to a compositor
+ * layer by Chromium, and composited semi-transparent paints flash
+ * invisible/visible on some Windows GPU/WebView2 drivers (#373; #381 only
+ * dampened it). Virtualized by TIME — only the boxes inside the visible
+ * window (+ buffer) are mounted.
  *
  * Props:
  *   segments        sorted-by-start segment array (store shape)
@@ -131,13 +148,14 @@ export default function SegmentTrack({
     [effSegments, viewStart, viewEnd],
   );
 
+  // Palette snapshot re-blends against the new --chrome-bg on theme change
+  // (#963) — new array identity per re-blend, so the memo below recolors.
+  const regionColors = useSyncExternalStore(subscribeRegionColors, getRegionColors);
   const speakerColor = useMemo(() => {
     const speakers = [...new Set(segments.map((s) => s.speaker_id).filter(Boolean))];
-    const bySpeaker = new Map(
-      speakers.map((sp, i) => [sp, REGION_COLORS[i % REGION_COLORS.length]]),
-    );
-    return (seg, idx) => bySpeaker.get(seg.speaker_id) || REGION_COLORS[idx % REGION_COLORS.length];
-  }, [segments]);
+    const bySpeaker = new Map(speakers.map((sp, i) => [sp, regionColors[i % regionColors.length]]));
+    return (seg, idx) => bySpeaker.get(seg.speaker_id) || regionColors[idx % regionColors.length];
+  }, [segments, regionColors]);
 
   // ── Onset tick strip (one viewport-sized canvas, non-interactive) ───────
   useEffect(() => {
@@ -464,11 +482,19 @@ export default function SegmentTrack({
 
   const innerWidth = Math.max(viewWidth, Math.ceil(duration * pxPerSec));
   const playheadX = currentTime * pxPerSec - effScroll;
-  const windowed = effSegments.slice(lo, hi);
+  const windowed =
+    effSegments.length <= VIRTUALIZE_THRESHOLD ? effSegments : effSegments.slice(lo, hi);
+  // Scroll offset baked into each box's `left` (viewport coordinates) instead
+  // of a `translateX` on the lane — an animated lane transform is composited
+  // by Chromium and flashes on some Windows GPU/WebView2 drivers (#373). In
+  // the selfScroll fallback the viewport is a real scroll container, so boxes
+  // stay in lane coordinates (offset 0). The virtualization window above
+  // derives from the same effScroll, so both stay consistent by construction.
+  const laneShift = selfScroll ? 0 : effScroll;
 
   return (
     <div
-      className={`seg-track relative w-full select-none mt-[2px] ${disabled ? 'is-disabled' : ''}`}
+      className={`seg-track relative w-full select-none mt-[2px] shrink-0 flex-none min-h-[50px] ${disabled ? 'is-disabled' : ''}`}
       ref={hostRef}
     >
       <canvas
@@ -489,14 +515,16 @@ export default function SegmentTrack({
           aria-orientation="horizontal"
           title={t('timeline.keyboard_hint')}
           style={{
-            width: innerWidth,
-            transform: selfScroll ? undefined : `translateX(${-effScroll}px)`,
+            // selfScroll needs the full content width for the native
+            // scrollbar range; in synced mode the lane is a static
+            // viewport-sized strip (NO transform — see laneShift above).
+            width: selfScroll ? innerWidth : '100%',
           }}
         >
           {windowed.map((s) => {
             const sid = String(s.id);
             const idx = indexById.get(sid) ?? 0;
-            const left = s.start * pxPerSec;
+            const left = s.start * pxPerSec - laneShift;
             const width = Math.max(2, (s.end - s.start) * pxPerSec);
             const isSel = selectedId != null && String(selectedId) === sid;
             const isFocus = focusId === sid;

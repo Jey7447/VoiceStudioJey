@@ -5,7 +5,7 @@ Every folder has a single job. Every file at the root earns its place.
 ## Layout
 
 ```
-OmniVoice/
+VoiceStudio/
 │
 ├── README.md                    ⟵ user-facing overview
 ├── CHANGELOG.md                 ⟵ release history
@@ -60,10 +60,14 @@ OmniVoice/
 │   └── frontend/                Node-based frontend tests
 │
 ├── scripts/                     ⟵ dev / build / release shell + python scripts
-│   ├── install.sh               universal installer
+│   ├── install.sh               universal installer (macOS/Linux/WSL)
+│   ├── install.ps1              universal installer (Windows)
 │   ├── run.sh                   universal launcher
 │   ├── smoke-test.sh            end-to-end validation
 │   └── desktop-prod.sh          production desktop build
+
+├── infra/                       ⟵ edge/deploy workers (not the Docker deploy path)
+│   └── install-redirect/        voicestudio.sh/install — UA-sniffing installer worker
 │
 ├── deploy/                      ⟵ Docker deployment configs
 │   ├── Dockerfile               single-stage CUDA image
@@ -81,16 +85,6 @@ OmniVoice/
 │   ├── data_preparation.md
 │   ├── evaluation.md
 │   └── voice-design.md
-│
-├── design/                      ⟵ ASCII mockups of the target UX
-│   ├── README.md
-│   └── 00–08-*.md               per-feature specs
-│
-├── research/                    ⟵ reference material, competitor analysis, archived code
-│   ├── LEARNINGS.md             competitive analysis, what to absorb
-│   ├── TheWhisper/              vendored reference (read-only)
-│   ├── voice-pro/               vendored reference
-│   └── legacy_gradio/           archived Gradio UI (pre-React rewrite)
 │
 ├── examples/                    ⟵ runnable demos + sample inputs
 │
@@ -119,8 +113,7 @@ OmniVoice/
 | Everything executable but not user-facing | `scripts/` |
 | Tests | `tests/` |
 | Developer + user docs (Markdown) | `docs/` |
-| Target-state mockups | `design/` |
-| Competitor clones, legacy code, ref material | `research/` |
+| Architecture decision records (ADRs) | `docs/adr/` |
 | Runnable demos and sample data | `examples/` |
 | Runtime data (never committed) | `~/Library/Application Support/OmniVoice/` on Mac |
 
@@ -136,15 +129,25 @@ Removed in the cleanup pass:
 | `crash_log.txt` | Runtime log. Now written to `$DATA_DIR/crash_log.txt`. | Deleted. |
 | `omnivoice.zip` (148 MB) | Offline reference archive of the project itself. | Moved out of the repo to `../omnivoice.zip.bak`. |
 | `data/` | Only contained `.DS_Store`. | Deleted. |
-| `legacy_gradio/` | The pre-React Gradio UI. Kept for historical reference. | Archived to `research/legacy_gradio/`. |
+| `legacy_gradio/` | The pre-React Gradio UI. Kept for historical reference. | Archived to `research/legacy_gradio/`, then removed in the 2026-07-12 cleanup (git history). |
 | Scattered `.DS_Store` files | macOS Finder droppings. | Deleted from every non-ignored directory. |
+
+Removed in the 2026-07-12 cleanup pass (all preserved in git history):
+
+| Dir | Why it was there | Where it went |
+|---|---|---|
+| `.planning/` (74 files) | GSD-era planning archive: phases, quick plans, issue clusters. The GSD workflow was retired 2026-07-08. | Deleted; the four load-bearing decision docs moved to `docs/adr/`. |
+| `specs/` | spec-kit specs for features 001–007 — all shipped. | Deleted. |
+| `design/` | ASCII mockups of the pre-React target UX, superseded by the shipped app. | Deleted. |
+| `research/` | Archived legacy Gradio UI + April-2026 competitor notes. | Deleted. |
+| `.agents/` | Rules for a third-party agent tool no longer in use. | Deleted. |
 
 ## Scaling path (proposed, not yet executed)
 
 The current flat layout works fine for the current size. If the project grows to include additional apps (a mobile companion, a plugin SDK, multiple backends), migrate to a Turborepo-style monorepo:
 
 ```
-OmniVoice/
+VoiceStudio/
 ├── apps/
 │   ├── api/                 ← was backend/
 │   ├── web/                 ← was frontend/
@@ -156,9 +159,7 @@ OmniVoice/
 │   ├── docker/
 │   └── pyinstaller/
 ├── tests/
-├── docs/
-├── design/
-└── research/
+└── docs/
 ```
 
 **Do not execute this migration without a dedicated PR.** It breaks:

@@ -1,19 +1,17 @@
 /**
  * Settings → Network.
  *
- * The proxy + FFmpeg-path controls that used to live in GeneralTab's "Advanced"
- * collapsible, promoted to their own top-level category. Logic is unchanged —
- * both persist via the backend `/system/set-env` durable env writer and
- * invalidate the systemInfo query so badges refresh.
- *
- * FFmpeg takes effect on the next backend start (durable env), so it carries a
- * RestartBadge; the proxy applies to subsequent downloads immediately.
+ * Proxy only. The FFmpeg-path override that used to share this panel moved to
+ * Settings → Audio tools (same backend store — prefs `env.FFMPEG_PATH` via
+ * `/media-tools` — richer controls: version, origin, restore bundled); a
+ * pointer row below deep-links there so muscle memory still lands.
  */
 import React, { useEffect, useState } from 'react';
 import { toast } from 'react-hot-toast';
 import { useTranslation } from 'react-i18next';
 import { Wifi, Globe, Film } from 'lucide-react';
 import { useQueryClient } from '@tanstack/react-query';
+import { useAppStore } from '../../store';
 import { useSystemInfo, queryKeys } from '../../api/hooks';
 import { Button, Badge } from '../../ui';
 import { SettingsSection, SettingRow, SettingsInput } from './primitives';
@@ -24,41 +22,21 @@ export default function NetworkTab() {
   const { data: sysInfo } = useSystemInfo();
   const [proxyUrl, setProxyUrl] = useState('');
   const [proxySaved, setProxySaved] = useState(false);
+  const [proxyCleared, setProxyCleared] = useState(false);
   const [proxySaving, setProxySaving] = useState(false);
-  const [ffmpegPath, setFfmpegPath] = useState('');
-  const [ffmpegSaving, setFfmpegSaving] = useState(false);
   const queryClient = useQueryClient();
+  const openSettingsTab = useAppStore((s) => s.openSettingsTab);
 
   useEffect(() => {
-    if (!proxyUrl && !proxySaved) setProxyUrl(sysInfo?.proxy_url || '');
+    if (!proxyUrl && !proxySaved && !proxyCleared) setProxyUrl(sysInfo?.proxy_url || '');
   }, [sysInfo?.proxy_url]);
 
-  useEffect(() => {
-    if (!ffmpegPath) setFfmpegPath(sysInfo?.ffmpeg_path || '');
-  }, [sysInfo?.ffmpeg_path]);
-
   const ffmpegOk = sysInfo?.ffmpeg_ok;
-  const ffmpegCurrent = sysInfo?.ffmpeg_path;
-
-  const saveFfmpeg = async () => {
-    const value = ffmpegPath.trim();
-    setFfmpegSaving(true);
-    try {
-      const { apiFetch } = await import('../../api/client');
-      await apiFetch('/system/set-env', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key: 'FFMPEG_PATH', value }),
-      });
-      toast.success(t('settings.ffmpeg_saved'));
-      setFfmpegPath('');
-      queryClient.invalidateQueries({ queryKey: queryKeys.systemInfo });
-    } catch (e) {
-      toast.error(t('settings.save_failed', { message: e.message }));
-    } finally {
-      setFfmpegSaving(false);
-    }
-  };
+  // "A proxy is configured" must survive an app reload: derive it from the
+  // backend-persisted value, not only from a save in this session — otherwise
+  // the Clear button (and the "Set" badge) vanish on reload with the proxy
+  // still active and no way to remove it.
+  const proxyConfigured = !proxyCleared && (proxySaved || Boolean(sysInfo?.proxy_url));
 
   const saveProxy = async () => {
     const value = proxyUrl.trim();
@@ -81,6 +59,7 @@ export default function NetworkTab() {
       ]);
       toast.success(t('settings.proxy_saved'));
       setProxySaved(true);
+      setProxyCleared(false);
       queryClient.invalidateQueries({ queryKey: queryKeys.systemInfo });
     } catch (e) {
       toast.error(t('settings.save_failed', { message: e.message }));
@@ -109,6 +88,7 @@ export default function NetworkTab() {
       ]);
       setProxyUrl('');
       setProxySaved(false);
+      setProxyCleared(true);
       toast.success(t('settings.proxy_cleared'));
       queryClient.invalidateQueries({ queryKey: queryKeys.systemInfo });
     } catch (e) {
@@ -123,7 +103,7 @@ export default function NetworkTab() {
       icon={Wifi}
       title={t('settings.network', { defaultValue: 'Network' })}
       description={t('settings.network_desc', {
-        defaultValue: 'Proxy and FFmpeg paths for downloads and media processing.',
+        defaultValue: 'Proxy for downloads and model fetches.',
       })}
     >
       <SettingRow
@@ -133,7 +113,8 @@ export default function NetworkTab() {
         title={
           <>
             {t('settings.proxy')}
-            {proxySaved && (
+            <RestartBadge applies />
+            {proxyConfigured && (
               <Badge tone="success" size="xs">
                 {t('credentials.saved')}
               </Badge>
@@ -148,6 +129,7 @@ export default function NetworkTab() {
               value={proxyUrl}
               onChange={(e) => setProxyUrl(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && saveProxy()}
+              aria-label={t('settings.proxy_input_aria', { defaultValue: 'Proxy URL' })}
             />
             <Button
               size="sm"
@@ -158,8 +140,14 @@ export default function NetworkTab() {
             >
               {t('credentials.save')}
             </Button>
-            {proxySaved && (
-              <Button size="sm" variant="ghost" onClick={clearProxy} loading={proxySaving}>
+            {proxyConfigured && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={clearProxy}
+                loading={proxySaving}
+                data-testid="proxy-clear"
+              >
                 {t('settings.proxy_clear')}
               </Button>
             )}
@@ -167,9 +155,9 @@ export default function NetworkTab() {
         }
       />
 
+      {/* Pointer, not a control — the FFmpeg override lives in Audio tools now.
+          Two competing writers of env.FFMPEG_PATH would fight each other. */}
       <SettingRow
-        align="start"
-        stack
         icon={Film}
         title={
           <>
@@ -177,32 +165,21 @@ export default function NetworkTab() {
             <Badge tone={ffmpegOk ? 'success' : 'warn'} size="xs">
               {ffmpegOk ? t('settings.ffmpeg_found') : t('settings.ffmpeg_missing')}
             </Badge>
-            <RestartBadge />
           </>
         }
-        note={
-          ffmpegCurrent
-            ? `${t('settings.ffmpeg_current')}: ${ffmpegCurrent}`
-            : t('settings.ffmpeg_desc')
-        }
+        note={t('settings.audio_tools_moved_note', {
+          defaultValue:
+            'The FFmpeg override moved to its own panel with more control (version, origin, restore).',
+        })}
         control={
-          <>
-            <SettingsInput
-              placeholder="D:\ffmpeg\bin\ffmpeg.exe"
-              value={ffmpegPath}
-              onChange={(e) => setFfmpegPath(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && saveFfmpeg()}
-            />
-            <Button
-              size="sm"
-              variant="subtle"
-              onClick={saveFfmpeg}
-              loading={ffmpegSaving}
-              disabled={!ffmpegPath.trim()}
-            >
-              {t('credentials.save')}
-            </Button>
-          </>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => openSettingsTab('audio-tools')}
+            data-testid="open-audio-tools"
+          >
+            {t('settings.audio_tools_open', { defaultValue: 'Open Audio tools' })} →
+          </Button>
         }
       />
     </SettingsSection>

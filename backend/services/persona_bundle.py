@@ -23,7 +23,7 @@ OVSVOICE_FORMAT = "ovsvoice"
 OVSVOICE_SCHEMA_VERSION = 1
 MAX_BUNDLE_BYTES = 100 * 1024 * 1024          # 100 MB (mirrors marketplace cap)
 _MIN_CONSENT_AUDIO_BYTES = 1000               # the consent-recording floor
-DEFAULT_LICENSE = "LicenseRef-OmniVoice-Personal"
+DEFAULT_LICENSE = "LicenseRef-VoiceStudio-Personal"
 PREVIEW_MAX_SECONDS = 8.0                      # preview length cap (A6)
 PREVIEW_SAMPLE_RATE = 24_000                  # preview rate; mono, 16-bit PCM (A8)
 
@@ -39,7 +39,7 @@ _MEMBER_EXT_RE = re.compile(r"^\.[A-Za-z0-9]{1,8}$")
 # carries no CodeQL py/polynomial-redos surface.
 _SPDX_ALLOWLIST: frozenset[str] = frozenset({
     "CC0-1.0", "CC-BY-4.0", "CC-BY-SA-4.0", "CC-BY-NC-4.0", "CC-BY-NC-SA-4.0",
-    "CC-BY-ND-4.0", "MIT", "Apache-2.0", "LicenseRef-OmniVoice-Personal",
+    "CC-BY-ND-4.0", "MIT", "Apache-2.0", "LicenseRef-VoiceStudio-Personal",
 })
 
 
@@ -149,7 +149,7 @@ def build_consent_json(profile: dict, *, has_recording: bool) -> Optional[dict]:
 
 def _legacy_metadata(profile: dict, omnivoice_version: str) -> dict:
     """A ``metadata.json`` payload shaped like marketplace ``_bundle_metadata`` so
-    an OLDER OmniVoice (which only reads metadata.json) can still import the ref
+    an OLDER VoiceStudio (which only reads metadata.json) can still import the ref
     audio from a ``.ovsvoice`` bundle."""
     return {
         "bundle_version": 1,
@@ -229,9 +229,12 @@ def _generate_preview(profile: dict, embed_fn) -> tuple[bytes, bool, float]:
 
 
 def _default_embed(wav, sample_rate):
-    """Default preview watermarker: services.watermark.embed_watermark(force=True)."""
-    from services.watermark import embed_watermark
-    return embed_watermark(wav, sample_rate, force=True)
+    """Default preview watermarker — routes through the mark_synthetic
+    chokepoint (#1169) with force=True: a persona bundle's preview mandates a
+    mark at package time regardless of the user's watermark pref."""
+    from services.watermark import mark_synthetic
+    return mark_synthetic(wav, sample_rate, force=True,
+                          context="persona_bundle.preview")
 
 
 def build_persona_bundle(

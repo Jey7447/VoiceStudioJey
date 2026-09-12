@@ -3,6 +3,8 @@ import sqlite3
 import logging
 from contextlib import contextmanager
 from core.config import DB_PATH
+from core import db_backup
+from core.version import APP_VERSION
 
 logger = logging.getLogger("omnivoice.db")
 
@@ -68,6 +70,7 @@ _BASE_SCHEMA = """
         duration_seconds REAL,
         generation_time REAL,
         seed INTEGER DEFAULT NULL,
+        starred INTEGER DEFAULT 0,
         created_at REAL,
         FOREIGN KEY (profile_id) REFERENCES voice_profiles(id)
     );
@@ -173,6 +176,108 @@ _BASE_SCHEMA = """
         created_at REAL
     );
     CREATE INDEX IF NOT EXISTS idx_pron_lang ON pronunciation_entries(language);
+
+    -- Remote GPU workers (docs/remote-workers.md). Opt-in: an install with no
+    -- remote workers never writes a row here and behaves exactly as before.
+    --
+    -- `public_key` is the worker's identity — a server-assigned id is a name,
+    -- not proof, so every reconnect is verified against this key. Revocation
+    -- is a persisted fact (not in-memory state) precisely so a restart of the
+    -- control plane cannot silently readmit a worker the user removed.
+    CREATE TABLE IF NOT EXISTS remote_workers (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL DEFAULT '',
+        key_id TEXT NOT NULL,
+        public_key BLOB NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        revoked INTEGER NOT NULL DEFAULT 0,
+        revoked_at REAL,
+        priority INTEGER NOT NULL DEFAULT 50,
+        endpoint TEXT NOT NULL DEFAULT '',
+        host_json TEXT NOT NULL DEFAULT '{}',
+        capabilities_json TEXT NOT NULL DEFAULT '[]',
+        max_concurrent_tasks INTEGER NOT NULL DEFAULT 1,
+        -- Bumped on every successful (re)connect. Messages stamped with an
+        -- older epoch are from a session we have already replaced.
+        session_epoch INTEGER NOT NULL DEFAULT 0,
+        consent_granted_at REAL,
+        created_at REAL NOT NULL,
+        last_seen_at REAL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_workers_key ON remote_workers(key_id);
+
+    -- Single-use join tokens. Only the hash is stored: the plaintext exists
+    -- once, in the dialog that shows it.
+    CREATE TABLE IF NOT EXISTS remote_worker_enrollments (
+        token_id TEXT PRIMARY KEY,
+        secret_hash TEXT NOT NULL,
+        endpoint TEXT NOT NULL DEFAULT '',
+        cert_fingerprint TEXT NOT NULL DEFAULT '',
+        label TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL,
+        expires_at REAL NOT NULL,
+        used_at REAL,
+        used_by_worker TEXT
+    );
+
+    -- Tasks dispatched to remote workers. Unlike the local `jobs` table (whose
+    -- startup sweep marks anything in-flight as failed), these must SURVIVE a
+    -- control-plane restart: the desktop app quits while a remote GPU keeps
+    -- rendering, and the worker is the source of truth for what is still
+    -- running. Reconciliation on reconnect rebuilds live state from here.
+    CREATE TABLE IF NOT EXISTS remote_tasks (
+        id TEXT PRIMARY KEY,
+        -- Client-supplied; deduplicates client retries before the worker
+        -- protocol is involved at all.
+        idempotency_key TEXT,
+        operation TEXT NOT NULL,
+        engine TEXT NOT NULL DEFAULT '',
+        model_id TEXT NOT NULL DEFAULT '',
+        params_json TEXT NOT NULL DEFAULT '{}',
+        priority INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL DEFAULT 'queued',
+        max_attempts INTEGER NOT NULL DEFAULT 3,
+        excluded_json TEXT NOT NULL DEFAULT '[]',
+        error_json TEXT,
+        -- Written BEFORE RESULT_ACK is sent. If the server dies between
+        -- receiving a result and acknowledging it, the worker redelivers and
+        -- this row is what makes the second delivery a no-op instead of a
+        -- silently lost multi-minute render.
+        result_ref TEXT,
+        result_json TEXT,
+        project_id TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        deadline_at REAL,
+        -- Deliberate additive-reconcile exception to the alembic rule: remote
+        -- task recovery must work in bundled installs where alembic may be
+        -- unavailable, and this nullable affinity column is additive-only.
+        pinned_worker_id TEXT,
+        finished_at REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_remote_tasks_state ON remote_tasks(state, priority, created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_tasks_idem ON remote_tasks(idempotency_key)
+        WHERE idempotency_key IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS remote_task_attempts (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        worker_id TEXT NOT NULL,
+        session_epoch INTEGER NOT NULL DEFAULT 0,
+        attempt_number INTEGER NOT NULL DEFAULT 1,
+        state TEXT NOT NULL DEFAULT 'assigned',
+        progress REAL NOT NULL DEFAULT 0,
+        stage TEXT NOT NULL DEFAULT '',
+        error_json TEXT,
+        created_at REAL NOT NULL,
+        accepted_at REAL,
+        started_at REAL,
+        finished_at REAL,
+        lease_expires_at REAL,
+        grace_expires_at REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_remote_attempts_task ON remote_task_attempts(task_id);
+    CREATE INDEX IF NOT EXISTS idx_remote_attempts_worker ON remote_task_attempts(worker_id, state);
 """
 
 # Only tables/columns this module is allowed to ALTER. Prevents SQL injection via
@@ -312,14 +417,88 @@ def init_db():
     _run_alembic_upgrade()
 
 
+class MigrationError(RuntimeError):
+    """A schema migration failed *while executing*. Startup must NOT continue
+    on a possibly half-migrated database — the caller lets this propagate so
+    the process stops with an actionable message naming the pre-migration
+    backup (see ``core.db_backup``). Restore is deliberately manual: silently
+    auto-restoring the snapshot could itself discard user data."""
+
+
+def _reconcile_after_alembic_skip() -> None:
+    """Converge the schema directly when alembic can't run at all (not
+    importable, or stamped at a removed revision — #552/#547) so additive
+    columns still land instead of 500-ing on `no such column`. Only for the
+    "nothing was applied" classes; a mid-migration failure must NOT reach
+    here (see MigrationError)."""
+    try:
+        conn = get_db()
+        try:
+            _reconcile_additive_columns(conn)
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("schema reconcile after alembic skip also failed: %s", exc)
+
+
+def _stamped_revisions(db_path: str) -> set | None:
+    """Revisions recorded in ``alembic_version`` (empty set = never stamped),
+    or None when the DB can't be read."""
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            try:
+                return {r[0] for r in conn.execute("SELECT version_num FROM alembic_version")}
+            except sqlite3.OperationalError:
+                return set()  # table absent — nothing ever stamped
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _plan_alembic(cfg) -> str:
+    """Decide what an ``upgrade head`` run would actually do:
+
+    - ``up_to_date``       — stamped at head; upgrade is a no-op.
+    - ``pending``          — migrations WILL execute (snapshot the DB first).
+    - ``unknown_revision`` — stamped at a revision this build doesn't ship
+      (preview→stable downgrade, #552/#547); upgrade would fail before
+      applying anything, so skip it and reconcile additively instead.
+    - ``indeterminate``    — can't tell; treat like pending (snapshot, run).
+    """
+    try:
+        from alembic.script import ScriptDirectory
+
+        script = ScriptDirectory.from_config(cfg)
+        known = {rev.revision for rev in script.walk_revisions()}
+        heads = set(script.get_heads())
+        stamped = _stamped_revisions(DB_PATH)
+        if stamped is None:
+            return "indeterminate"
+        if stamped and not stamped <= known:
+            return "unknown_revision"
+        if stamped == heads:
+            return "up_to_date"
+        return "pending"
+    except Exception:  # noqa: BLE001
+        return "indeterminate"
+
+
 def _run_alembic_upgrade() -> None:
-    """Best-effort `alembic upgrade head` on startup. Non-fatal: if alembic
-    isn't reachable (e.g. a stripped-down install) or its version is stamped at
-    a revision no longer in versions/ (e.g. after running a preview build), log
-    a warning and move on. The schema is still kept correct by
-    _reconcile_additive_columns (run in init_db above and again here on failure)
-    — CREATE TABLE IF NOT EXISTS alone does NOT add columns to a pre-existing
-    table, so the reconcile is what actually guarantees additive columns land."""
+    """`alembic upgrade head` on startup, wrapped in the data-safety net.
+
+    Failure classes are handled differently on purpose:
+
+    - alembic unavailable / stamped at an unknown revision → **non-fatal**
+      (nothing was applied; warn + `_reconcile_additive_columns` keeps the
+      schema converged, exactly the pre-existing #552/#547 behavior).
+    - migrations actually pending → the DB is snapshotted first
+      (``omnivoice.db.backup-<version>-<n>``, newest 3 kept), then upgraded.
+    - a migration fails **while executing** → raise :class:`MigrationError`:
+      startup stops with a message naming the backup, instead of silently
+      running the app on a half-migrated DB.
+    """
     try:
         import os
         from alembic import command
@@ -335,18 +514,72 @@ def _run_alembic_upgrade() -> None:
             return
         cfg = Config(ini)
         cfg.set_main_option("sqlalchemy.url", f"sqlite:///{DB_PATH}")
+        # In-app run: alembic.ini's logging section must not touch the live
+        # app's logging. env.py's fileConfig() — even with
+        # disable_existing_loggers=False — replaces the root logger's handlers
+        # and applies [logger_root] level=WARN, so every boot that actually
+        # migrated (first run, upgrades) lost the omnivoice.log file handler
+        # and all INFO logging for the rest of the process — including the
+        # graceful-shutdown trace, making a SIGTERM'd clean quit look like a
+        # silent crash (#1174). env.py checks this attribute; the standalone
+        # `alembic` CLI (which doesn't set it) keeps its logging config.
+        cfg.attributes["configure_logger"] = False
+    except Exception as exc:  # noqa: BLE001 — alembic not importable / bad ini
+        logger.warning("alembic upgrade head skipped: %s", exc)
+        _reconcile_after_alembic_skip()
+        return
+
+    plan = _plan_alembic(cfg)
+    if plan == "up_to_date":
+        return
+    if plan == "unknown_revision":
+        logger.warning(
+            "alembic_version is stamped at a revision this build doesn't ship "
+            "(preview/newer build ran on this DB) — skipping alembic and "
+            "reconciling the schema additively (#552/#547)"
+        )
+        _reconcile_after_alembic_skip()
+        return
+
+    # Migrations may actually execute: snapshot the DB first so a failed or
+    # interrupted migration can never cost user data. A backup problem alone
+    # must not brick startup (the >500 MB skip is by design), so log and go on.
+    # ``db_backup``/``APP_VERSION`` are module-level imports (top of file), not
+    # re-imported here: a test that patches ``core.db_backup.MAX_BACKUP_DB_BYTES``
+    # on the object it imported at collection must see the same object this
+    # function uses. A lazy ``from core import db_backup`` would re-resolve
+    # through the (possibly re-imported) ``core`` package and silently miss the
+    # patch after another suite purged ``core.*`` from ``sys.modules``.
+    backup_path = None
+    try:
+        backup_path = db_backup.snapshot_before_migration(DB_PATH, APP_VERSION)
+    except Exception:  # noqa: BLE001
+        logger.exception("Pre-migration DB backup failed — continuing without one")
+
+    try:
         command.upgrade(cfg, "head")
     except Exception as exc:
-        # Don't block startup on a migration tooling problem. Converge the schema
-        # directly so a swallowed failure (alembic not importable, or
-        # alembic_version stamped at a removed revision) still lands the additive
-        # columns instead of 500-ing on `no such column` (#552/#547).
-        logger.warning("alembic upgrade head skipped: %s", exc)
-        try:
-            conn = get_db()
-            try:
-                _reconcile_additive_columns(conn)
-            finally:
-                conn.close()
-        except Exception as exc2:  # noqa: BLE001
-            logger.warning("schema reconcile after alembic failure also failed: %s", exc2)
+        if "Can't locate revision" in str(exc):
+            # Belt for an unknown-revision case _plan_alembic missed: alembic
+            # bails before applying anything, so the old non-fatal path is safe.
+            logger.warning("alembic upgrade head skipped: %s", exc)
+            _reconcile_after_alembic_skip()
+            return
+        backup_note = (
+            f"A backup of your data from just before the migration is at: {backup_path}"
+            if backup_path
+            else "No pre-migration backup was written this run (see the log above)"
+        )
+        msg = (
+            f"Database migration failed while running: {exc}. "
+            f"VoiceStudio stopped instead of running on a partially migrated database, "
+            f"and nothing was auto-restored (your database at {DB_PATH} was left "
+            f"exactly as the failed migration left it). "
+            f"{backup_note}. "
+            "What to do: relaunch to retry; if it keeps failing, report it at "
+            "https://github.com/debpalash/VoiceStudio/issues (keep the backup file). "
+            "To roll back manually: quit the app, replace omnivoice.db with the backup "
+            "file, and reinstall the previous version."
+        )
+        logger.error(msg)
+        raise MigrationError(msg) from exc

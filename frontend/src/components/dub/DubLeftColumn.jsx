@@ -18,13 +18,16 @@ import { useAppStore } from '../../store';
 import WaveformTimeline from '../WaveformTimeline';
 import MultiLangPicker from '../MultiLangPicker';
 import { API } from '../../api/client';
+import { dubListTracks } from '../../api/dub';
 import { LANG_CODES } from '../../utils/languages';
 import ALL_LANGUAGES from '../../languages.json';
-import { POPULAR_LANGS, PRESETS } from '../../utils/constants';
+import { POPULAR_LANGS } from '../../utils/constants';
 import { dialectOptionsFor, dialectLabel, dialectMatchesLang } from '../../api/dialects';
+import { dubSegmentsText } from '../../api/dub';
 import { copyText } from '../../utils/copyText';
 import { openExternal } from '../../api/external';
 import { TRANSLATION_ENGINES_DOCS } from '../../utils/errorDocsMap';
+import CastingBoard from './CastingBoard';
 import toast from 'react-hot-toast';
 
 // ── Translation-settings bar utility class clusters ──────────────────────
@@ -54,6 +57,7 @@ export default function DubLeftColumn({
   setPreviewMode,
   dubTracks,
   videoSrc,
+  playbackAudioSrc,
   waveformRef,
   dubJobId,
   dubSegments,
@@ -97,17 +101,24 @@ export default function DubLeftColumn({
   engines,
   setTranslateProvider,
   setTranslateQuality,
-  llmEndpoint,
   multiLangMode,
   setMultiLangMode,
   multiLangs,
   setMultiLangs,
+  multiLangProgress,
   editSegments,
 }) {
-  // High-quality (Cinematic/Autofit) translation needs an LLM. When one isn't
-  // configured, we route the user straight to the LLM Providers setup instead
-  // of dead-ending on a toast (#838).
-  const openSettingsTab = useAppStore((s) => s.openSettingsTab);
+  // Two-stage LLM translation quality — only meaningful (and only rendered)
+  // when the LLM engine is the active translator. Persisted prefs.
+  const autoGlossary = useAppStore((s) => s.autoGlossary);
+  const setAutoGlossary = useAppStore((s) => s.setAutoGlossary);
+  const reflectPass = useAppStore((s) => s.reflectPass);
+  const setReflectPass = useAppStore((s) => s.setReflectPass);
+  // Opt-in LLM condensation suggestions for segments the duration planner
+  // classifies as impossible to fit (default OFF — needs an LLM).
+  const condenseSuggest = useAppStore((s) => s.condenseSuggest);
+  const setCondenseSuggest = useAppStore((s) => s.setCondenseSuggest);
+  const failedTranslationCount = dubSegments.filter((segment) => segment.translate_error).length;
   // Frozen-build (packaged/signed, read-only site-packages) escape-hatch
   // popover: pip install is impossible, so we surface the copyable command +
   // a one-click switch to the always-bundled Argos engine + a docs deeplink.
@@ -143,8 +154,91 @@ export default function DubLeftColumn({
     else toast.error(t('dub.copy_failed'));
   };
 
+  // Per-track metadata (duration + timing strategy) for the pill tooltips.
+  // The store only carries the track codes, so hydrate lazily from the
+  // existing GET /dub/tracks/{job_id} once the editor shows tracks (re-runs
+  // when a new language finishes and dubTracks changes). Failure-silent:
+  // the pills render fine without tooltips.
+  const [trackInfo, setTrackInfo] = useState({});
+  useEffect(() => {
+    if (!hasDubbedTrack || !dubJobId) return undefined;
+    let cancelled = false;
+    dubListTracks(dubJobId)
+      .then((tracks) => {
+        if (!cancelled) setTrackInfo(tracks || {});
+      })
+      .catch(() => {
+        /* tooltip enrichment only — never block or toast */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [hasDubbedTrack, dubJobId, dubTracks]);
+  const trackTooltip = (code) => {
+    const info = trackInfo[code];
+    if (!info) return undefined;
+    const parts = [];
+    if (Number.isFinite(info.duration) && info.duration > 0) {
+      parts.push(
+        t('dub.track_tip_duration', {
+          duration: fmtDur(Math.round(info.duration)),
+          defaultValue: 'Duration {{duration}}',
+        }),
+      );
+    }
+    if (info.timing_strategy) {
+      // Reuse the timing-strategy display names where they exist
+      // (dub.timing_<id>); unknown/future strategies fall back to the raw id.
+      const strategy = t(`dub.timing_${info.timing_strategy}`, {
+        defaultValue: info.timing_strategy,
+      });
+      parts.push(t('dub.track_tip_timing', { strategy, defaultValue: 'Timing {{strategy}}' }));
+    }
+    return parts.length ? parts.join(' · ') : undefined;
+  };
+
+  async function hydrateMissingTranslations(code) {
+    const st = useAppStore.getState();
+    const jobId = st.dubJobId;
+    if (!jobId) return;
+    const missing = st.dubSegments.some(
+      (seg) =>
+        !(
+          seg.translations &&
+          typeof seg.translations[code] === 'string' &&
+          seg.translations[code].trim()
+        ),
+    );
+    if (!missing) return;
+    try {
+      const texts = await dubSegmentsText(jobId, code);
+      if (!texts || !Object.keys(texts).length) return;
+      const cur = useAppStore.getState();
+      if (cur.dubLangCode !== code) return; // user already switched again
+      cur.setDubSegments(
+        cur.dubSegments.map((seg, i) => {
+          const key = seg.id != null ? String(seg.id) : String(i);
+          const incoming = texts[key];
+          const has =
+            seg.translations &&
+            typeof seg.translations[code] === 'string' &&
+            seg.translations[code].trim();
+          if (has || typeof incoming !== 'string' || !incoming.trim()) return seg;
+          return {
+            ...seg,
+            text: incoming,
+            translations: { ...seg.translations, [code]: incoming },
+            merge_parts: undefined,
+          };
+        }),
+      );
+    } catch {
+      /* advisory — rows keep their previous-language text, as before */
+    }
+  }
+
   return (
-    <div className="studio-panel dub-panel-col">
+    <div className="studio-panel dub-panel-col dub-panel-left">
       {hasDubbedTrack && (
         <div
           className="dub-lang-switch"
@@ -169,7 +263,28 @@ export default function DubLeftColumn({
                 role="radio"
                 aria-checked={previewMode === code}
                 className={`dub-lang-pill ${previewMode === code ? 'is-active' : ''}`}
-                onClick={() => setPreviewMode(code)}
+                onClick={() => {
+                  setPreviewMode(code);
+                  // The transcript/segment list follows the previewed track:
+                  // swap segment texts to this language's saved translations
+                  // (the P1.2 per-language store — non-destructive, exactly
+                  // what the language dropdown and multi-language generate
+                  // already do). Without this, previewing German played
+                  // German audio over, say, Bengali segment text.
+                  const st = useAppStore.getState();
+                  st.setDubLang(label);
+                  st.switchDubLangCode(code);
+                  // Review finding (#1148): the in-browser translations map
+                  // can be PARTIAL (tracks generated before per-language
+                  // persistence, partial regens) — the non-destructive switch
+                  // then leaves those rows in the previous language, a
+                  // mixed-language transcript under a single-language track.
+                  // Hydrate the gaps from the backend's authoritative
+                  // segments_i18n store. Failure-silent: no data → the rows
+                  // keep what they had, exactly the pre-hydration behavior.
+                  hydrateMissingTranslations(code);
+                }}
+                title={trackTooltip(code)}
               >
                 {label}
               </button>
@@ -182,6 +297,7 @@ export default function DubLeftColumn({
         ref={waveformRef}
         audioSrc={`${API}/dub/audio/${dubJobId}`}
         videoSrc={videoSrc}
+        playbackFallbackSrc={playbackAudioSrc}
         segments={dubSegments}
         onsets={timelineOnsets}
         selectedSegId={timelineSelSegId}
@@ -239,71 +355,19 @@ export default function DubLeftColumn({
         }
       />
 
-      {/* Cast — per-speaker voice assignment. When the auto-clone
-                  extractor found a usable passage per speaker (≥5s from the
-                  isolated vocals), that option becomes first-class in the
-                  dropdown. It's also pre-selected on the segments so "new
-                  language = same speaker's voice" works by default. */}
-      {dubSegments.some((s) => s.speaker_id) && (
-        <div className="mt-[2px] px-[var(--space-3)] py-[3px] bg-[var(--chrome-bg)] rounded-[var(--chrome-radius-pill)] border border-transparent">
-          <div className="flex gap-[var(--space-2)] items-center flex-wrap">
-            <span
-              className="font-[family-name:var(--chrome-font-mono)] text-[length:var(--chrome-label-size)] text-[var(--chrome-fg-muted)] tracking-[var(--chrome-label-track)] uppercase font-semibold"
-              title={t('dub.cast_title')}
-            >
-              {t('dub.cast')}
-            </span>
-            {[...new Set(dubSegments.map((s) => s.speaker_id).filter(Boolean))].map((spk) => {
-              const autoId = `auto:${(spk || '').toLowerCase().replace(/\s+/g, '_')}`;
-              const clone = speakerClones[spk];
-              return (
-                <div key={spk} className="dub-cast__pair">
-                  <span className="font-[family-name:var(--chrome-font-mono)] text-[0.62rem] text-[var(--chrome-fg)]">
-                    {spk}:
-                  </span>
-                  <select
-                    className="input-base dub-cast__select"
-                    value={dubSegments.find((s) => s.speaker_id === spk)?.profile_id || ''}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      setDubSegments(
-                        dubSegments.map((s) =>
-                          s.speaker_id === spk ? { ...s, profile_id: val } : s,
-                        ),
-                      );
-                    }}
-                  >
-                    {clone && (
-                      <option value={autoId}>
-                        {t('dub.from_video', { duration: clone.duration.toFixed(1) })}
-                      </option>
-                    )}
-                    <option value="">{t('dub.default')}</option>
-                    {profiles.length > 0 && (
-                      <optgroup label={t('dub.clone_profiles')}>
-                        {profiles.map((p) => (
-                          <option key={p.id} value={p.id}>
-                            {p.name}
-                          </option>
-                        ))}
-                      </optgroup>
-                    )}
-                    {PRESETS.length > 0 && (
-                      <optgroup label={t('dub.design_presets')}>
-                        {PRESETS.map((p) => (
-                          <option key={p.id} value={`preset:${p.id}`}>
-                            {p.name}
-                          </option>
-                        ))}
-                      </optgroup>
-                    )}
-                  </select>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
+      {/* Cast — per-speaker voice assignment: the compact dropdown strip plus
+          the drag-and-drop casting board. Renders nothing when no segment
+          carries a speaker. When the auto-clone extractor found a usable
+          passage per speaker (≥5s from the isolated vocals), that option is
+          first-class in both views and pre-selected on the segments so "new
+          language = same speaker's voice" works by default. */}
+      <CastingBoard
+        t={t}
+        dubSegments={dubSegments}
+        setDubSegments={setDubSegments}
+        speakerClones={speakerClones}
+        profiles={profiles}
+      />
 
       {/* Translation settings — collapsed or expanded */}
       {!settingsOpen && (
@@ -560,38 +624,7 @@ export default function DubLeftColumn({
                 className="w-full"
                 size="sm"
                 value={translateQuality}
-                onChange={(v) => {
-                  // #372/#838: Cinematic AND Autofit need an LLM (Autofit rewrites
-                  // each line to fit its segment's time budget). If none is
-                  // configured, don't dead-end — offer a one-click jump to the
-                  // LLM Providers setup and point at the timing payoff.
-                  const needsLLM = v === 'cinematic' || v === 'autofit';
-                  if (needsLLM && llmEndpoint && !llmEndpoint.available) {
-                    toast(
-                      (tt) => (
-                        <span className="flex items-center gap-[10px]">
-                          {t('dub.hq_needs_llm_hint', {
-                            defaultValue:
-                              'High-quality translation fits each line to its segment time using a local or cloud LLM. Set one up to enable it.',
-                          })}
-                          <Button
-                            size="sm"
-                            variant="primary"
-                            onClick={() => {
-                              toast.dismiss(tt.id);
-                              openSettingsTab('llm-providers');
-                            }}
-                          >
-                            {t('dub.set_up_llm', { defaultValue: 'Set up' })}
-                          </Button>
-                        </span>
-                      ),
-                      { icon: 'ℹ️', duration: 10000 },
-                    );
-                    return;
-                  }
-                  setTranslateQuality(v);
-                }}
+                onChange={setTranslateQuality}
                 items={[
                   { value: 'fast', label: t('dub.fast_quality') },
                   {
@@ -601,7 +634,54 @@ export default function DubLeftColumn({
                   { value: 'cinematic', label: t('dub.cinematic_quality') },
                 ]}
               />
+              {/* Opt-in (default OFF): when the duration planner marks a
+                  translated line "impossible" for its slot, ask the LLM for a
+                  shorter rewrite the user can apply per segment. */}
+              <label
+                className="flex items-center gap-[4px] mt-[3px] text-[0.55rem] text-fg-muted cursor-pointer select-none"
+                title={t('dub.condense_title')}
+              >
+                <input
+                  type="checkbox"
+                  checked={condenseSuggest}
+                  onChange={(e) => setCondenseSuggest(e.target.checked)}
+                  className="cursor-pointer"
+                />
+                {t('dub.condense_label')}
+              </label>
             </div>
+            {/* LLM engine only: auto-glossary + reflect pass. Both default ON;
+                the reflect tooltip is explicit that it multiplies LLM calls. */}
+            {translateProvider === 'openai' && (
+              <div
+                className={`${FIELD} flex-[0_0_auto] ${FIELD_RESP} justify-end gap-[2px] pb-[2px]`}
+              >
+                <label
+                  className="flex items-center gap-[4px] text-[0.6rem] text-[var(--chrome-fg-muted)] cursor-pointer whitespace-nowrap"
+                  title={t('dub.auto_glossary_title')}
+                >
+                  <input
+                    type="checkbox"
+                    className="accent-[var(--color-brand)] cursor-pointer"
+                    checked={autoGlossary}
+                    onChange={(e) => setAutoGlossary(e.target.checked)}
+                  />
+                  <span>{t('dub.auto_glossary_label')}</span>
+                </label>
+                <label
+                  className="flex items-center gap-[4px] text-[0.6rem] text-[var(--chrome-fg-muted)] cursor-pointer whitespace-nowrap"
+                  title={t('dub.reflect_title')}
+                >
+                  <input
+                    type="checkbox"
+                    className="accent-[var(--color-brand)] cursor-pointer"
+                    checked={reflectPass}
+                    onChange={(e) => setReflectPass(e.target.checked)}
+                  />
+                  <span>{t('dub.reflect_label')}</span>
+                </label>
+              </div>
+            )}
             <div className={`${FIELD} flex-[1_1_90px] min-w-[64px] ${FIELD_RESP}`}>
               <div className={FIELD_LABEL}>
                 <UserSquare2 className="label-icon" size={9} /> {t('dub.style')}{' '}
@@ -631,11 +711,40 @@ export default function DubLeftColumn({
                   selected={multiLangs}
                   onChange={setMultiLangs}
                   disabled={dubStep === 'generating'}
+                  progressByCode={multiLangProgress}
                 />
               )}
             </div>
           </div>
           <div className="flex justify-end gap-[6px] flex-wrap">
+            {failedTranslationCount > 0 && (
+              <>
+                <Button
+                  variant="subtle"
+                  size="sm"
+                  onClick={() => handleTranslateAll({ retryFailed: true })}
+                  disabled={isTranslating}
+                >
+                  {t('dub.retry_failed', { count: failedTranslationCount })}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() =>
+                    editSegments(
+                      dubSegments.map((segment) =>
+                        segment.translate_error
+                          ? { ...segment, translate_error: undefined, translation_skipped: true }
+                          : segment,
+                      ),
+                    )
+                  }
+                  disabled={isTranslating}
+                >
+                  {t('dub.skip_failed')}
+                </Button>
+              </>
+            )}
             <Button
               variant="subtle"
               size="sm"
@@ -645,6 +754,7 @@ export default function DubLeftColumn({
                     ...s,
                     text: s.text_original || s.text,
                     translate_error: undefined,
+                    translate_degraded: undefined,
                   })),
                 )
               }

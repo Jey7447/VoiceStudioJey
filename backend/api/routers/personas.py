@@ -16,6 +16,8 @@ import asyncio
 import functools
 import logging
 import os
+
+from utils.fsops import safe_replace
 import time
 import uuid
 
@@ -26,6 +28,8 @@ from core import event_bus
 from core.config import VOICES_DIR  # noqa: F401 — re-exported for tests/monkeypatch
 from core.db import db_conn
 from core.version import APP_VERSION
+from core.logging_utils import log_safe
+from core.http_headers import content_disposition
 from services import persona_bundle as pb
 
 router = APIRouter()
@@ -85,8 +89,8 @@ async def export_persona(
             detail="This profile has no readable reference or locked audio to "
                    "build a preview from — re-create or re-import it.",
         )
-    except Exception:
-        logger.exception("persona export failed for %s", profile_id)
+    except Exception as exc:
+        logger.error("persona export failed for %s: %s", log_safe(profile_id), log_safe(exc))
         raise HTTPException(
             status_code=503,
             detail="Could not build the persona bundle — see Settings → Logs.",
@@ -98,7 +102,7 @@ async def export_persona(
         BytesIO(content),
         media_type="application/zip",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": content_disposition(filename),
             "Content-Length": str(len(content)),
         },
     )
@@ -233,15 +237,18 @@ async def import_persona(file: UploadFile = File(...)):
             _insert(profile_id)
 
     except HTTPException:
-        _cleanup(written)
+        if not _cleanup(written):
+            raise HTTPException(status_code=500, detail="Import failed, and temporary files could not be removed. Close any app using them and retry cleanup.")
         raise
     except Exception:
-        _cleanup(written)
-        logger.exception("persona import failed")
-        raise HTTPException(status_code=500, detail="Import failed; no files were kept.")
+        cleaned = _cleanup(written)
+        logger.warning("Persona import failed")
+        detail = ("Import failed; no files were kept." if cleaned else
+                  "Import failed, and temporary files could not be removed. Close any app using them and retry cleanup.")
+        raise HTTPException(status_code=500, detail=detail)
 
     event_bus.emit("profiles", {"action": "created", "id": profile_id})
-    logger.info("Imported persona %r as %s (verified=%s)", persona.get("name"), profile_id, verified)
+    logger.info("Imported persona %s as %s (verified=%s)", log_safe(persona.get("name")), log_safe(profile_id), verified)
 
     return {
         "success": True,
@@ -257,13 +264,16 @@ async def import_persona(file: UploadFile = File(...)):
     }
 
 
-def _cleanup(paths: list[str]) -> None:
+def _cleanup(paths: list[str]) -> bool:
+    complete = True
     for p in paths:
         try:
             if p and os.path.exists(p):
                 os.remove(p)
         except OSError:
-            pass
+            complete = False
+            logger.warning("Persona import temporary-file cleanup did not complete")
+    return complete
 
 
 def _rename_for_new_id(written: list[str], new_id: str) -> list[str]:
@@ -276,7 +286,7 @@ def _rename_for_new_id(written: list[str], new_id: str) -> list[str]:
         new_base = new_id + base[8:]
         new_path = os.path.join(d, new_base)
         try:
-            os.replace(p, new_path)
+            safe_replace(p, new_path)
             out.append(new_path)
         except OSError:
             out.append(p)

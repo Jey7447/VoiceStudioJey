@@ -13,6 +13,7 @@ from core.config import VOICES_DIR, OUTPUTS_DIR
 from core import event_bus
 from core.personalities import get_personalities
 from omnivoice.utils.voice_design import heal_design_instruct, sanitize_instruct
+from core.path_security import UnsafePath, resolve_within
 
 router = APIRouter()
 
@@ -73,6 +74,17 @@ async def create_profile(
                 raise ValueError("not an object")
         except ValueError:
             raise HTTPException(status_code=422, detail="vd_states must be a JSON object")
+        # Root-cause close for #983: a design profile must never be PERSISTED
+        # with a partial vd_states shape, regardless of which client (older
+        # frontend build, hand-edited payload, third-party API caller) created
+        # it — a missing category key crashes DesignMethodPanel's render on
+        # every future client that selects this profile. CATEGORY_ORDER is the
+        # same single source of truth the frontend's CATEGORIES keys mirror
+        # (core/describe_voice.py), so this can't drift from the picker.
+        from core.describe_voice import CATEGORY_ORDER
+        for _cat in CATEGORY_ORDER:
+            parsed.setdefault(_cat, "Auto")
+        vd_states = _json.dumps(parsed)
         # An all-Auto design (every category left on "Auto") yields an empty
         # instruct — that's still a valid, saveable voice: synthesis falls back
         # to neutral instruct-only conditioning (see generation.py design path).
@@ -84,6 +96,14 @@ async def create_profile(
         # rebuild the tags from vd_states — so the row is always generation-safe
         # regardless of which frontend build saved it.
         instruct = heal_design_instruct(instruct, parsed)
+    else:
+        # Clone-kind saves get the same server-side choke point (audit finding:
+        # this class — "Unsupported instruct items" 400s on every later use —
+        # recurred THREE times via clients that bypassed the frontend filter,
+        # and the save-time heal above was gated to design-kind). A clone
+        # profile has no vd_states to rebuild from, so this is sanitize-only:
+        # valid tags survive, prose/"[object Object]" is dropped.
+        instruct = sanitize_instruct(instruct)
 
     profile_id = str(uuid.uuid4())[:8]
 
@@ -358,13 +378,18 @@ async def lock_profile(
         if not history or not history["audio_path"]:
             raise HTTPException(status_code=404, detail="History item not found or has no audio")
 
-        src_path = os.path.join(OUTPUTS_DIR, history["audio_path"])
-        if not os.path.exists(src_path):
+        try:
+            src_path = resolve_within(OUTPUTS_DIR, history["audio_path"])
+        except UnsafePath as exc:
+            raise HTTPException(status_code=400, detail="Invalid history audio path") from exc
+        if not src_path.is_file():
             raise HTTPException(status_code=404, detail="Audio file not found on disk")
 
         locked_filename = f"{profile_id}_locked.wav"
-        locked_path = os.path.join(VOICES_DIR, locked_filename)
-        shutil.copy2(src_path, locked_path)
+        locked_path = _voices_path(locked_filename)
+        if locked_path is None:
+            raise HTTPException(status_code=400, detail="Invalid profile id")
+        shutil.copy2(str(src_path), locked_path)
 
         ref_text = history["text"][:100] if history["text"] else ""
 
@@ -386,8 +411,8 @@ async def unlock_profile(profile_id: str):
             )
 
         if profile["locked_audio_path"]:
-            locked_path = os.path.join(VOICES_DIR, profile["locked_audio_path"])
-            if os.path.exists(locked_path):
+            locked_path = _voices_path(profile["locked_audio_path"])
+            if locked_path and os.path.exists(locked_path):
                 os.remove(locked_path)
 
         conn.execute(

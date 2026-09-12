@@ -21,6 +21,7 @@ Check shape:
 """
 from __future__ import annotations
 
+import importlib
 import os
 import platform
 import shutil
@@ -88,17 +89,33 @@ def _check_device() -> dict:
 
 
 def _check_ffmpeg() -> dict:
+    """Media engine (ffmpeg + ffprobe) — an internal dependency the app
+    bundles/acquires itself, so a failure here means the self-heal also has
+    nothing to work with (and the hint says where the controls live)."""
+    ffmpeg = ffprobe = None
     try:
-        from services.ffmpeg_utils import find_ffmpeg
-        path = find_ffmpeg()
+        from services.ffmpeg_utils import find_ffmpeg, find_ffprobe
+        ffmpeg = find_ffmpeg()
+        ffprobe = find_ffprobe()
     except Exception:
-        path = None
-    if path:
-        return _check("ffmpeg", "ffmpeg", OK, str(path))
+        pass
+    if ffmpeg and ffprobe:
+        return _check("ffmpeg", "Media engine (ffmpeg)", OK,
+                      f"ffmpeg: {ffmpeg}; ffprobe: {ffprobe}")
+    if ffmpeg:
+        return _check(
+            "ffmpeg", "Media engine (ffmpeg)", WARN,
+            f"ffmpeg: {ffmpeg}; ffprobe missing",
+            "Media probing (Smart Fit, file inspection) is degraded. Open "
+            "Settings > Audio tools and press Restore bundled to fetch the "
+            "app's own ffprobe, or point it at a system copy there.",
+        )
     return _check(
-        "ffmpeg", "ffmpeg", FAIL,
-        "not found on PATH or FFMPEG_PATH",
-        "Dubbing and audio conversion need ffmpeg: brew install ffmpeg (macOS), apt install ffmpeg (Linux), or set the path in Settings > General.",
+        "ffmpeg", "Media engine (ffmpeg)", FAIL,
+        "no runnable ffmpeg in any tier (sidecar, bundled, system, custom)",
+        "Dubbing and audio conversion are unavailable. The app normally "
+        "provisions ffmpeg itself — open Settings > Audio tools and press "
+        "Restore bundled (needs network once), or choose a system copy there.",
     )
 
 
@@ -184,12 +201,12 @@ def _check_engines() -> dict:
         return _check(
             "engines", "TTS engines", FAIL,
             f"{detail} - active engine '{active}' is unavailable: {reason}",
-            active_row.get("install_hint") or "Pick a different engine in Settings > Engines.",
+            active_row.get("install_hint") or "Pick a different engine in Model Catalogue > Engines.",
         )
     if not available:
         return _check(
             "engines", "TTS engines", FAIL, detail,
-            "No usable TTS engine. Install one from Settings > Engines.",
+            "No usable TTS engine. Install one from Model Catalogue > Engines.",
         )
     return _check("engines", "TTS engines", OK, detail)
 
@@ -351,10 +368,44 @@ def run_diagnostics(include_network: bool = True, deep: bool = False) -> dict:
     counts = {OK: 0, WARN: 0, FAIL: 0}
     for c in checks:
         counts[c["status"]] += 1
+    engine_execution = []
+    for family in ("tts", "asr"):
+        active = "unknown"
+        try:
+            module = importlib.import_module(f"services.{family}_backend")
+            active = module.active_backend_id()
+            row = next((item for item in module.list_backends() if item.get("id") == active), None)
+            if row is not None:
+                engine_execution.append({
+                    "family": family,
+                    "engine_id": active,
+                    **row["execution_evidence"],
+                })
+        except Exception:  # noqa: BLE001 - evidence must not break diagnostics
+            # Preserve the other family's successful evidence and make this
+            # collection failure explicit without exposing exception text.
+            engine_execution.append({
+                "family": family,
+                "engine_id": active,
+                "implementation_variant": None,
+                "declared_device_families": [],
+                "evidence_state": "collection_failed",
+                "actual_execution_provider": None,
+                "actual_execution_device": None,
+                "gpu_name": None,
+                "gpu_architecture": None,
+                "precision_or_quantization": None,
+                "cpu_fallback_reason": None,
+                "cpu_fallback_stage": None,
+                "parent_memory_observable": None,
+                "runtime_versions": {},
+            })
+
     return {
         "app_version": APP_VERSION,
         "platform": scrub_text(platform.platform()),
         "checks": checks,
+        "engine_execution": engine_execution,
         "summary": {
             "ok": counts[FAIL] == 0,
             "passed": counts[OK],
@@ -372,13 +423,42 @@ def format_text(report: dict) -> str:
     """
     tag = {OK: "[ OK ]", WARN: "[WARN]", FAIL: "[FAIL]"}
     lines = [
-        f"OmniVoice Studio self-check - v{report['app_version']} on {report['platform']}",
+        f"VoiceStudio self-check - v{report['app_version']} on {report['platform']}",
         "",
     ]
     for c in report["checks"]:
         lines.append(f"{tag[c['status']]} {c['label']}: {c['detail']}")
         if c.get("hint"):
             lines.append(f"       hint: {c['hint']}")
+    if report.get("engine_execution"):
+        lines.append("")
+        lines.append("Engine execution evidence:")
+        for item in report["engine_execution"]:
+            if item.get("actual_execution_provider"):
+                provider = item["actual_execution_provider"]
+            elif item.get("evidence_state") == "subprocess_loaded_provider_unreported":
+                provider = "loaded child; provider not reported"
+            else:
+                provider = "not loaded"
+            precision = item.get("precision_or_quantization") or "unknown"
+            device = item.get("actual_execution_device") or "unknown"
+            gpu = item.get("gpu_name") or "none"
+            architecture = item.get("gpu_architecture") or "unknown"
+            fallback_stage = item.get("cpu_fallback_stage") or "none"
+            fallback_reason = item.get("cpu_fallback_reason") or "none"
+            versions = ",".join(
+                f"{name}={version}"
+                for name, version in sorted(item.get("runtime_versions", {}).items())
+            ) or "none"
+            visible = "yes" if item.get("parent_memory_observable") else "no"
+            lines.append(
+                f"  {item['family']}:{item['engine_id']} provider={provider}; "
+                f"device={device}; gpu={gpu}; architecture={architecture}; "
+                f"precision={precision}; fallback-stage={fallback_stage}; "
+                f"fallback-reason={fallback_reason}; runtimes={versions}; "
+                f"evidence-state={item.get('evidence_state', 'unknown')}; "
+                f"parent-memory-visible={visible}"
+            )
     s = report["summary"]
     lines.append("")
     lines.append(

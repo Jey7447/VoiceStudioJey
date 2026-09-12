@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { useAppStore } from '../store';
 import { listProfiles } from '../api/profiles';
 import { listHistory } from '../api/generate';
@@ -8,11 +8,34 @@ import { listExportHistory } from '../api/exports';
 import { modelStatus as apiModelStatus } from '../api/system';
 import { useModelStatus } from '../api/hooks';
 import useRealtimeEvents from './useRealtimeEvents';
+import { mergeDescribedAttrs } from '../utils/voiceInstruct';
+import { sanitizeOmniUi } from '../utils/omniUiSchema';
+import { loadLatest, retryInitialLoad } from '../utils/initialLoadRetry';
+import { queueJsonWrite } from '../utils/coalescedJsonStorage';
 
 /**
  * Encapsulates all data-loading effects, localStorage persistence,
  * real-time WebSocket updates, and model-status pill management.
  */
+
+// Dub steps that describe live, in-process work ('uploading', 'transcribing',
+// 'generating', 'stopping') must never be restored across an app restart: the
+// task they referred to died with the process, so rehydrating one leaves the
+// Dub tab waiting forever on progress that will never arrive (blank pane +
+// eternal spinner — the "stuck on dubbing since I updated" reports, and a
+// reinstall doesn't clear the webview's localStorage). Only settled states
+// come back.
+const STABLE_DUB_STEPS = new Set(['idle', 'editing', 'done']);
+export const OMNI_UI_KEY = 'omni_ui';
+
+/** Clamp a persisted dubStep to a state that is valid after a cold start.
+ *  Stable steps pass through; transient (and unknown/corrupt) values fall
+ *  back to 'editing' when the session has segments to show, else 'idle'. */
+export function clampRestoredDubStep(savedStep, savedSegments) {
+  if (STABLE_DUB_STEPS.has(savedStep)) return savedStep;
+  return Array.isArray(savedSegments) && savedSegments.length > 0 ? 'editing' : 'idle';
+}
+
 export default function useAppData() {
   const mode = useAppStore((s) => s.mode);
   const setMode = useAppStore((s) => s.setMode);
@@ -69,6 +92,45 @@ export default function useAppData() {
   const [studioProjects, setStudioProjects] = useState([]);
   const [exportHistory, setExportHistory] = useState([]);
   const [showOverrides, setShowOverrides] = useState(false);
+  const [omniUiRestoreComplete, setOmniUiRestoreComplete] = useState(false);
+  const omniUiWriteDisposerRef = useRef(null);
+
+  const omniUiSnapshotRef = useRef(null);
+  const omniUiSnapshot = {
+    uiScale,
+    text,
+    mode,
+    defineMethod,
+    vdStates,
+    language,
+    isSidebarCollapsed,
+    sidebarTab,
+    dubJobId,
+    dubFilename,
+    dubDuration,
+    dubSegments,
+    dubLang,
+    dubLangCode,
+    dubTracks,
+    dubStep,
+    dubTranscript,
+    exportTracks,
+    preserveBg,
+    defaultTrack,
+    exportHistory,
+    speed,
+    steps,
+    cfg,
+    denoise,
+    showOverrides,
+  };
+  // Only expose committed state to the deferred writer. Publishing during
+  // render would let a timer or lifecycle flush observe a concurrent render
+  // that React later abandons. Layout effects run before the passive effect
+  // that registers the provider, without copying any nested document data.
+  useLayoutEffect(() => {
+    omniUiSnapshotRef.current = omniUiSnapshot;
+  });
 
   // ── Model status (TanStack Query) ──
   // Sysinfo lives in Header (the only consumer) so its 5s poll doesn't
@@ -102,31 +164,37 @@ export default function useAppData() {
   }, [modelStatus, modelSubStage, modelDetail, modelError, modelProgress]);
 
   // ── Data loading callbacks ──
-  const loadProfiles = useCallback(async () => {
-    try {
-      setProfiles(await listProfiles());
-    } catch (e) {}
-  }, []);
-  const loadHistory = useCallback(async () => {
-    try {
-      setHistory(await listHistory());
-    } catch (e) {}
-  }, []);
-  const loadDubHistory = useCallback(async () => {
-    try {
-      setDubHistory(await listDubHistory());
-    } catch (e) {}
-  }, []);
-  const loadProjects = useCallback(async () => {
-    try {
-      setStudioProjects(await listProjects());
-    } catch (e) {}
-  }, []);
-  const loadExportHistory = useCallback(async () => {
-    try {
-      setExportHistory(await listExportHistory());
-    } catch (e) {}
-  }, []);
+  // WS-triggered reloads swallow failures: keeping the previous list is
+  // better than blanking the UI, and the warn gives "my voices vanished"
+  // reports a cause (#1158). The INITIAL load passes `{ rethrow: true }` so
+  // retryInitialLoad can retry — there is no previous list to keep yet.
+  // Each loader is last-write-wins by invocation order: a slow in-flight
+  // request (the initial retry loop overlaps freely with WS reloads) must
+  // not overwrite the fresher list a later reload already applied. Plain
+  // per-render closures over stable imports/setters — a useRef-free module
+  // would need hooks inside a helper, which rules-of-hooks forbids.
+  const loadersRef = useRef({ profiles: 0, history: 0, dub: 0, projects: 0, exports: 0 });
+  const makeLoader =
+    (key, fetch, set, label) =>
+    ({ rethrow } = {}) =>
+      loadLatest({
+        generations: loadersRef.current,
+        key,
+        fetch,
+        apply: set,
+        label,
+        rethrow,
+      });
+  const loadProfiles = makeLoader('profiles', listProfiles, setProfiles, 'voice profiles');
+  const loadHistory = makeLoader('history', listHistory, setHistory, 'generation history');
+  const loadDubHistory = makeLoader('dub', listDubHistory, setDubHistory, 'dub history');
+  const loadProjects = makeLoader('projects', listProjects, setStudioProjects, 'projects');
+  const loadExportHistory = makeLoader(
+    'exports',
+    listExportHistory,
+    setExportHistory,
+    'export history',
+  );
 
   // ── WebSocket real-time updates ──
   useRealtimeEvents({
@@ -139,10 +207,10 @@ export default function useAppData() {
 
   // ── Initial data load with backend retry ──
   useEffect(() => {
-    let cancelled = false;
+    const cancelledRef = { cancelled: false };
     const loadAll = async () => {
       let delay = 1000;
-      while (!cancelled) {
+      while (!cancelledRef.cancelled) {
         try {
           await apiModelStatus();
           break;
@@ -150,17 +218,25 @@ export default function useAppData() {
         await new Promise((r) => setTimeout(r, delay));
         delay = Math.min(delay * 2, 4000);
       }
-      if (cancelled) return;
-      loadProfiles();
-      loadHistory();
-      loadDubHistory();
-      loadProjects();
-      loadExportHistory();
+      if (cancelledRef.cancelled) return;
+      // Initial loads retry until FIRST success (#1158 class): a later
+      // (WS-triggered) reload failure keeps the previous list, but the first
+      // load has no previous list to keep — one transient failure used to
+      // leave the panel empty, which read as "my voices are gone".
+      retryInitialLoad(() => loadProfiles({ rethrow: true }), cancelledRef);
+      retryInitialLoad(() => loadHistory({ rethrow: true }), cancelledRef);
+      retryInitialLoad(() => loadDubHistory({ rethrow: true }), cancelledRef);
+      retryInitialLoad(() => loadProjects({ rethrow: true }), cancelledRef);
+      retryInitialLoad(() => loadExportHistory({ rethrow: true }), cancelledRef);
     };
     loadAll();
     // Restore local UI state
     try {
-      const saved = JSON.parse(localStorage.getItem('omni_ui') || '{}');
+      // Whitelist + shape-check every persisted field (audit: the #1067 class
+      // was healed per-field; this closes it generically — malformed values
+      // are dropped up front instead of throwing mid-restore and silently
+      // discarding every field after the bad one).
+      const saved = sanitizeOmniUi(JSON.parse(localStorage.getItem(OMNI_UI_KEY) || '{}'));
       if (saved.uiScale) setUiScale(saved.uiScale);
       if (saved.text) setText(saved.text);
       // Legacy shim (voice-studio-unification P4): the old 'clone'/'design'
@@ -172,9 +248,19 @@ export default function useAppData() {
       } else if (saved.mode === 'design') {
         setMode('studio');
         setDefineMethod('design');
+      } else if (saved.mode === 'queue') {
+        // Legacy shim: the batch queue's mode id is 'batch' (the store's Mode
+        // union); 'queue' was an App.jsx-only id that nothing could set, but
+        // normalize any persisted copy of it rather than strand the restore.
+        setMode('batch');
       } else if (saved.mode) setMode(saved.mode);
       if (saved.defineMethod) setDefineMethod(saved.defineMethod);
-      if (saved.vdStates) setVdStates(saved.vdStates);
+      // #983: legacy localStorage state had no shape validation at all — a
+      // partial/corrupt saved.vdStates crashed DesignMethodPanel on restore.
+      // Mirror useProfiles.js's guard: require a plain object, then complete
+      // it to the full CATEGORIES shape (missing/unknown keys → 'Auto').
+      if (saved.vdStates && typeof saved.vdStates === 'object')
+        setVdStates(mergeDescribedAttrs(saved.vdStates));
       if (saved.language) setLanguage(saved.language);
       if (saved.isSidebarCollapsed !== undefined) setIsSidebarCollapsed(saved.isSidebarCollapsed);
       if (saved.sidebarTab) setSidebarTab(saved.sidebarTab);
@@ -188,7 +274,7 @@ export default function useAppData() {
       if (saved.dubLang) setDubLang(saved.dubLang);
       if (saved.dubLangCode) setDubLangCode(saved.dubLangCode);
       if (saved.dubTracks) setDubTracks(saved.dubTracks);
-      if (saved.dubStep) setDubStep(saved.dubStep);
+      if (saved.dubStep) setDubStep(clampRestoredDubStep(saved.dubStep, saved.dubSegments));
       if (saved.dubTranscript) setDubTranscript(saved.dubTranscript);
       if (saved.exportTracks) setExportTracks(saved.exportTracks);
       if (saved.preserveBg !== undefined) setPreserveBg(saved.preserveBg);
@@ -199,46 +285,29 @@ export default function useAppData() {
       if (saved.cfg) setCfg(saved.cfg);
       if (saved.denoise !== undefined) setDenoise(saved.denoise);
       if (saved.showOverrides !== undefined) setShowOverrides(saved.showOverrides);
-    } catch (e) {}
+    } catch (e) {
+      // Preserve the existing fail-open recovery behavior: malformed or
+      // inaccessible legacy state falls back to the initialized defaults.
+    } finally {
+      // The initial persistence effect closes over `false` and therefore
+      // cannot flush defaults. The restored render becomes the first writer.
+      setOmniUiRestoreComplete(true);
+    }
     return () => {
-      cancelled = true;
+      cancelledRef.cancelled = true;
     };
   }, []);
 
   // ── Persist to localStorage ──
   useEffect(() => {
-    localStorage.setItem(
-      'omni_ui',
-      JSON.stringify({
-        uiScale,
-        text,
-        mode,
-        defineMethod,
-        vdStates,
-        language,
-        isSidebarCollapsed,
-        sidebarTab,
-        dubJobId,
-        dubFilename,
-        dubDuration,
-        dubSegments,
-        dubLang,
-        dubLangCode,
-        dubTracks,
-        dubStep,
-        dubTranscript,
-        exportTracks,
-        preserveBg,
-        defaultTrack,
-        exportHistory,
-        speed,
-        steps,
-        cfg,
-        denoise,
-        showOverrides,
-      }),
-    );
+    if (!omniUiRestoreComplete) return undefined;
+    // Replacements must retain the scheduler's original maximum-wait window.
+    // React runs a dependency effect's cleanup before every new setup, so the
+    // generation disposer is intentionally reserved for a true unmount below.
+    omniUiWriteDisposerRef.current = queueJsonWrite(OMNI_UI_KEY, () => omniUiSnapshotRef.current);
+    return undefined;
   }, [
+    omniUiRestoreComplete,
     uiScale,
     text,
     mode,
@@ -266,6 +335,14 @@ export default function useAppData() {
     denoise,
     showOverrides,
   ]);
+
+  useEffect(
+    () => () => {
+      omniUiWriteDisposerRef.current?.();
+      omniUiWriteDisposerRef.current = null;
+    },
+    [],
+  );
 
   return {
     profiles,

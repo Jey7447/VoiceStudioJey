@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Activity,
@@ -14,11 +14,21 @@ import {
   Globe,
 } from 'lucide-react';
 import { Panel, Button, Badge, Tabs } from '../ui';
-import { listBatchJobs, cancelBatchJob, deleteBatchJob, enqueueBatchJob } from '../api/batch';
+import {
+  listBatchJobs,
+  getBatchJob,
+  cancelBatchJob,
+  deleteBatchJob,
+  enqueueBatchJob,
+} from '../api/batch';
 import { API } from '../api/client';
 import BatchAddDialog from '../components/BatchAddDialog';
+import WatchFolderBar from '../components/WatchFolderBar';
 import toast from 'react-hot-toast';
 import { toastErrorWithReport } from '../utils/errorToast';
+import { asrMissingPayload, toastAsrModelMissing } from '../utils/asrModelMissing';
+import { recordValueMoment } from '../utils/donationMoments';
+import { absoluteTime, timeAgo } from '../utils/relativeTime';
 
 /**
  * BatchQueue — UI for the /batch/* dubbing pipeline.
@@ -65,17 +75,49 @@ export default function BatchQueue({ onBack }) {
   const [loading, setLoading] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
 
+  // Settings the watch-folder ingest reuses: the last Add-to-queue submission,
+  // or the dialog's own defaults before any manual enqueue this session.
+  const lastSettingsRef = useRef({
+    langs: [{ lang: 'Spanish', code: 'es' }],
+    voiceId: '',
+    preserveBg: true,
+  });
+
+  // Ids last seen queued/running. The 'active' filter excludes finished jobs
+  // server-side, so a job VANISHING from the active list is the completion
+  // signal — resolve its final status to tell done apart from failed/cancelled.
+  const activeIdsRef = useRef(new Set());
+
+  const resolveFinishedJob = useCallback(async (id) => {
+    try {
+      const job = await getBatchJob(id);
+      // Success-only donation moment — a whole batch dub job finishing is a
+      // real deliverable. Failed/cancelled jobs never count.
+      if (job?.status === 'done') recordValueMoment('batch');
+    } catch {
+      /* job deleted or backend unreachable — not a completion */
+    }
+  }, []);
+
   const reload = useCallback(async () => {
     setLoading(true);
     try {
       const statusParam = tab === 'active' ? 'active' : tab;
-      setJobs(await listBatchJobs(statusParam, 100));
+      const next = await listBatchJobs(statusParam, 100);
+      setJobs(next);
+      if (statusParam === 'active') {
+        const nextIds = new Set(next.map((j) => j.id));
+        for (const id of activeIdsRef.current) {
+          if (!nextIds.has(id)) resolveFinishedJob(id);
+        }
+        activeIdsRef.current = nextIds;
+      }
     } catch (e) {
       console.warn('batch queue load failed', e);
     } finally {
       setLoading(false);
     }
-  }, [tab]);
+  }, [tab, resolveFinishedJob]);
 
   useEffect(() => {
     reload();
@@ -90,8 +132,10 @@ export default function BatchQueue({ onBack }) {
 
   const handleEnqueue = useCallback(
     async (files, settings) => {
+      lastSettingsRef.current = settings;
       const langCodes = settings.langs.map((l) => l.code);
       let success = 0;
+      const successfulFiles = new Set();
       for (const file of files) {
         try {
           await enqueueBatchJob(
@@ -101,7 +145,15 @@ export default function BatchQueue({ onBack }) {
             settings.preserveBg,
           );
           success++;
+          successfulFiles.add(file);
         } catch (e) {
+          const missing = asrMissingPayload(e);
+          if (missing) {
+            // Typed 409: no ASR model installed → one download CTA, then stop
+            // (every remaining file would fail the same preflight).
+            toastAsrModelMissing(missing);
+            break;
+          }
           toastErrorWithReport(
             t('batch.enqueue_failed', { name: file.name, message: e.message }),
             e,
@@ -113,8 +165,16 @@ export default function BatchQueue({ onBack }) {
         setTab('active');
         reload();
       }
+      return successfulFiles;
     },
     [t, reload],
+  );
+
+  // Watch-folder arrivals go through the exact same enqueue path (File
+  // uploads to POST /batch/enqueue) with the last-used / default settings.
+  const handleWatchIngest = useCallback(
+    (files) => handleEnqueue(files, lastSettingsRef.current),
+    [handleEnqueue],
   );
 
   const handleCancel = useCallback(
@@ -159,6 +219,7 @@ export default function BatchQueue({ onBack }) {
           <Activity size={15} /> {t('batch.title')}
         </div>
         <div className="batch-queue__bar-spacer flex-1" />
+        <WatchFolderBar onIngest={handleWatchIngest} />
         <Button
           variant="subtle"
           size="sm"
@@ -230,7 +291,7 @@ function JobCard({ job, onCancel, onDelete, t }) {
   const st = STATUS_TONE[job.status] || STATUS_TONE.queued;
   const StIcon = st.icon;
 
-  const ageLabel = formatAge((Date.now() / 1000 - (job.created_at || 0)) * 1000);
+  const ageLabel = timeAgo(job.created_at);
 
   const duration =
     job.finished_at && job.started_at ? Math.max(0, job.finished_at - job.started_at) : null;
@@ -256,7 +317,7 @@ function JobCard({ job, onCancel, onDelete, t }) {
         <span className="batch-queue__card-spacer flex-1" />
         <span
           className="batch-queue__card-age text-[var(--text-xs)] text-fg-subtle [font-variant-numeric:tabular-nums]"
-          title={new Date((job.created_at || 0) * 1000).toLocaleString()}
+          title={absoluteTime(job.created_at)}
         >
           {ageLabel}
         </span>
@@ -361,17 +422,6 @@ function JobCard({ job, onCancel, onDelete, t }) {
       </div>
     </Panel>
   );
-}
-
-function formatAge(ms) {
-  if (!isFinite(ms) || ms < 0) return '—';
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  return new Date(Date.now() - ms).toLocaleDateString();
 }
 
 function formatDuration(secs) {
